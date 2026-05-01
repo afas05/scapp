@@ -1,72 +1,103 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { ref, onBeforeUnmount } from "vue";
 import { open } from '@tauri-apps/plugin-shell';
 import { useUserStore } from "./stores/userStore";
-import { useWS } from "./composables/useWS.ts";
+// @ts-ignore — JS composable, no .d.ts
+import { useMediaSoup } from "./composables/useMediaSoup.js";
+// @ts-ignore — JS module, no .d.ts
+import { loadConfig } from "./config.js";
 
 const connectionState = ref(false);
 const connectProcess = ref(false);
-const state = ref(0);
 const producerId = ref('');
+const userSession = ref('');
+const viewerCount = ref(0);
+const errorMessage = ref('');
+
 const userStore = useUserStore();
-const ws = useWS(userStore.sessionHash);
+const mediaSoup = useMediaSoup();
 
-ws.onmessage = async (event) => {
-  const msg = JSON.parse(event.data);
+mediaSoup.on('producerCreated', (id: string, session: string) => {
+  console.log('[MediaSoup] Producer created:', id, 'session:', session);
+  producerId.value = id;
+  userSession.value = session;
+  connectionState.value = true;
+  connectProcess.value = false;
+});
 
-  switch (msg.type) {
-    case 'producerTransportCreated':
-      state.value = 1;
-      ws.send(JSON.stringify({ type: 'desktopProduce', kind: 'video', payloadType: 100 }))
-      break;
+mediaSoup.on('producerClosed', () => {
+  console.log('[MediaSoup] Producer closed');
+  connectionState.value = false;
+  producerId.value = '';
+  userSession.value = '';
+});
 
-    case 'plainProducerTransportConnected':
-      state.value = 2;
-      ws.send(JSON.stringify({ type: 'desktopProduce', kind: 'video', payloadType: 100 }))
-      break;
+mediaSoup.on('viewerCount', (count: number) => {
+  viewerCount.value = count;
+});
 
-    case 'producedCreated':
-      connectionState.value = true;
-      state.value = 3;
-      producerId.value = msg.id;
-      state.value = 4;
-      await invoke("start_stream");
-      break;
-  }
-};
+mediaSoup.on('streamEnded', () => {
+  console.log('[MediaSoup] Stream ended by server');
+  connectionState.value = false;
+});
 
 async function startStream() {
+  errorMessage.value = '';
   connectProcess.value = true;
-  ws.send(JSON.stringify({ type: 'createPlainTransport' }))
+  try {
+    const config = await loadConfig();
+    console.log('[MediaSoup] Connecting to SFU:', config.sfuWsUrl);
+    await mediaSoup.init(userStore.sessionHash, config);
+    await mediaSoup.startSharing();
+  } catch (err: any) {
+    console.error('[MediaSoup] Failed to start stream:', err);
+    errorMessage.value = `Failed to start stream: ${err?.message ?? err}`;
+    connectProcess.value = false;
+    try { await mediaSoup.destroy(); } catch {}
+  }
 }
 
-function stopStream() {
-  connectProcess.value = false;
+async function stopStream() {
+  try {
+    await mediaSoup.destroy();
+  } catch (err) {
+    console.error('[MediaSoup] Error during teardown:', err);
+  }
   connectionState.value = false;
-  state.value = 0;
-  ws.send(JSON.stringify({ type: 'close' }))
-  ws.close();
+  connectProcess.value = false;
+  producerId.value = '';
+  userSession.value = '';
 }
 
 function openStream() {
-  open('http://streamsnipe.live??streamId=' + producerId.value);
+  open('https://streamsnipe.live?streamId=' + producerId.value);
 }
+
+onBeforeUnmount(() => {
+  if (connectionState.value || connectProcess.value) {
+    mediaSoup.destroy().catch(() => {});
+  }
+});
 </script>
 
 <template>
   <div>
+    <div v-if="errorMessage" class="error-message">
+      {{ errorMessage }}
+    </div>
     <div v-if="!connectionState && !connectProcess">
       <button class="stream-button" @click="startStream">Stream</button>
     </div>
-    <div v-if="state > 3 && connectionState">
+    <div v-if="connectionState">
       <button id="stop-stream" class="stream-button" @click="stopStream">Stop stream</button>
     </div>
-    <div v-if="state < 3 && connectProcess" class="text-white">
-      Connecting...
+    <div v-if="connectProcess && !connectionState" class="text-white">
+      Connecting to SFU...
     </div>
-    <div v-if="state > 3" class="text-white">
-      Streaming... <a @click.prevent="openStream" :href="'http://streamsnipe.live??streamId=' + producerId">Open stream</a>
+    <div v-if="connectionState" class="text-white">
+      Streaming &mdash; viewers: {{ viewerCount }}
+      <br />
+      <a @click.prevent="openStream" :href="'https://streamsnipe.live?streamId=' + producerId">Open stream</a>
     </div>
   </div>
 </template>
@@ -74,6 +105,15 @@ function openStream() {
 <style scoped>
 .text-white {
   color: white;
+}
+.error-message {
+  color: #ff6b6b;
+  background-color: rgba(255, 107, 107, 0.1);
+  border: 1px solid #ff6b6b;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
 }
 .stream-button {
   border-radius: 9999px;

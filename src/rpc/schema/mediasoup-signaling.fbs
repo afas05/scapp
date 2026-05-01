@@ -1,0 +1,99 @@
+namespace MediasoupSignaling;
+
+enum Method: uint16 {
+    CreateProducerTransport = 0,
+    ConnectProducerTransport = 1,
+    Produce = 2,
+    CreateConsumerTransport = 3,
+    ConnectConsumerTransport = 4,
+    Consume = 5,
+    Resume = 6,
+    ProducerClosed = 7,
+    ViewerCount = 8,
+    StreamEnded = 9,
+    CreateProducerPlainTransport = 10,
+}
+
+// --- CreateProducerTransport ---
+table CreateProducerTransportRequest {}
+
+table CreateProducerTransportResponse {
+    id: string;
+    ice_parameters: string;   // JSON
+    ice_candidates: string;   // JSON
+    dtls_parameters: string;  // JSON
+}
+
+// --- ConnectProducerTransport ---
+table ConnectProducerTransportRequest {
+    dtls_parameters: string;  // JSON
+}
+
+table ConnectProducerTransportResponse {}
+
+// --- Produce ---
+table ProduceRequest {
+    kind: string;
+    rtp_parameters: string;   // JSON
+}
+
+table ProduceResponse {
+    id: string;
+    user_session: string;
+}
+
+// --- CreateConsumerTransport ---
+table CreateConsumerTransportRequest {}
+
+table CreateConsumerTransportResponse {
+    id: string;
+    ice_parameters: string;   // JSON
+    ice_candidates: string;   // JSON
+    dtls_parameters: string;  // JSON
+}
+
+// --- ConnectConsumerTransport ---
+table ConnectConsumerTransportRequest {
+    dtls_parameters: string;  // JSON
+}
+
+table ConnectConsumerTransportResponse {}
+
+// --- Consume ---
+table ConsumeRequest {
+    producer_id: string;
+    rtp_capabilities: string; // JSON
+}
+
+table ConsumeResponse {
+    id: string;
+    producer_id: string;
+    kind: string;
+    rtp_parameters: string;   // JSON
+}
+
+// --- Resume ---
+table ResumeRequest {}
+
+table ResumeResponse {}
+
+// --- ProducerClosed (notification, no response) ---
+table ProducerClosedRequest {}
+
+// --- ViewerCount (server -> client notification) ---
+table ViewerCountRequest {
+    count: int32;
+}
+
+// --- StreamEnded (server -> client notification) ---
+table StreamEndedRequest {}
+
+// --- CreateProducerPlainTransport (PlainTransport with comedia=true; no connect step) ---
+table CreateProducerPlainTransportRequest {}
+
+table CreateProducerPlainTransportResponse {
+    id: string;
+    ip: string;
+    port: uint16;        // RTP port the client must send to
+    rtcp_port: uint16;   // RTCP port (rtcpMux=false)
+}

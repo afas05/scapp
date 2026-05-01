@@ -10,6 +10,10 @@
     "opener:default",
     "websocket:default",
     "shell:default",
+    "store:allow-load",
+    "store:allow-get",
+    "store:allow-set",
+    "store:allow-save",
     {
       "identifier": "http:default",
       "allow": [

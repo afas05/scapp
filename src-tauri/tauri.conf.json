@@ -18,7 +18,12 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self' ipc: http://ipc.localhost",
+        "connect-src": "'self' wss: https: http:",
+        "media-src": "'self' blob: mediastream:",
+        "script-src": "'self' 'wasm-unsafe-eval'"
+      }
     }
   },
   "bundle": {
@@ -30,7 +35,6 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/kitava.ico"
-    ],
-    "resources": ["bin/streaming_app.exe"]
+    ]
   }
 }

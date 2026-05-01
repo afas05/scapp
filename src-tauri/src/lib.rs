@@ -1,37 +1,22 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-use std::env;
-use std::path::PathBuf;
-use std::process::Command;
+mod gstreamer;
 
-fn get_exe_path() -> Result<PathBuf, String> {
-    let exe_dir = env::current_exe()
-        .map_err(|e| format!("Failed to get exe path: {}", e))?
-        .parent()
-        .ok_or("Failed to get parent directory")?
-        .to_path_buf();
-
-    Ok(exe_dir.join("bin").join("streaming_app.exe"))
+#[tauri::command]
+async fn start_stream(host: String, rtp_port: u16, rtcp_port: u16) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gstreamer::start_streaming(host, rtp_port, rtcp_port)
+    })
+    .await
+    .map_err(|e| format!("Failed to join task: {}", e))?
 }
 
 #[tauri::command]
-async fn start_stream() -> Result<String, String> {
-    let exe_path = get_exe_path()?;
-
-    let result = tauri::async_runtime::spawn_blocking(|| {
-        let output = Command::new(exe_path).arg("some_argument").output();
-
-        output.map_err(|e| format!("Failed to run exe: {}", e))
+async fn stop_stream() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        gstreamer::stop_streaming()
     })
     .await
-    .map_err(|e| format!("Failed to join task: {}", e))?;
-
-    let output = result?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
+    .map_err(|e| format!("Failed to join task: {}", e))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -41,7 +26,8 @@ pub fn run() {
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_websocket::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![start_stream])
+        .plugin(tauri_plugin_store::Builder::default().build())
+        .invoke_handler(tauri::generate_handler![start_stream, stop_stream])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
