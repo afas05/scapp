@@ -2,9 +2,33 @@ use gstreamer as gst;
 use gstreamer_rtp as gst_rtp;
 use glib;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use std::env;
 use glib::ObjectExt;
 use gstreamer::prelude::{ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual, GstObjectExt, PadExtManual};
+
+// Diagnostic counters incremented by pad probes; the stats thread reads and
+// resets them once per second to compute per-stage rates.
+struct StreamCounters {
+    enc_buffers: AtomicU64,   // x264enc src — encoded frames out per second
+    pay_buffers: AtomicU64,   // rtph264pay src — RTP packets per second
+    pay_bytes: AtomicU64,
+    udp_buffers: AtomicU64,   // udpsink sink — actual network egress
+    udp_bytes: AtomicU64,
+}
+
+impl StreamCounters {
+    fn new() -> Self {
+        Self {
+            enc_buffers: AtomicU64::new(0),
+            pay_buffers: AtomicU64::new(0),
+            pay_bytes: AtomicU64::new(0),
+            udp_buffers: AtomicU64::new(0),
+            udp_bytes: AtomicU64::new(0),
+        }
+    }
+}
 
 // Constants
 const LOCAL_RTCP_PORT: i32 = 5003;
@@ -15,6 +39,7 @@ struct GstreamerState {
     pipeline: Option<gst::Pipeline>,
     main_loop: Option<glib::MainLoop>,
     bus_watch_guard: Option<gst::bus::BusWatchGuard>,
+    stats_stop: Option<Arc<AtomicBool>>,
 }
 
 impl GstreamerState {
@@ -23,6 +48,7 @@ impl GstreamerState {
             pipeline: None,
             main_loop: None,
             bus_watch_guard: None,
+            stats_stop: None,
         }
     }
 }
@@ -159,6 +185,18 @@ fn bus_call(_bus: &gst::Bus, msg: &gst::Message) -> glib::ControlFlow {
             println!("[GStreamer] Stream status message received");
             glib::ControlFlow::Continue
         }
+        gst::MessageView::Qos(_) => {
+            // QoS messages are posted by an element when it falls behind real
+            // time and drops/skips buffers. The source identifies which stage
+            // is the bottleneck (encoder / payloader / sink) and the structure
+            // contains dropped/processed counts and jitter.
+            eprintln!(
+                "[QoS] from {:?}: {:?}",
+                msg.src().map(|s| s.path_string()),
+                msg.structure()
+            );
+            glib::ControlFlow::Continue
+        }
         _ => glib::ControlFlow::Continue,
     }
 }
@@ -283,10 +321,96 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
     // Configure rtpbin for mediasoup compatibility.
     // ntp-time-source defaults to "ntp" (NTP time based on realtime clock),
     // which is what we want for valid RTCP SR timestamps — leave unset.
+    // do-retransmission=true makes rtpbin honor incoming NACK feedback by
+    // retransmitting lost RTP packets. Confirmed via webrtc-internals that
+    // the viewer negotiated RTX (rtxSsrc present) and was sending hundreds
+    // of NACKs per session — without RTX enabled, every lost packet that
+    // belonged to an IDR took out the whole keyframe and triggered a PLI,
+    // producing the visible 3–5 second freeze cadence.
     rtpbin.set_properties(&[
-        ("do-retransmission", &false),
+        ("do-retransmission", &true),
         ("rtp-profile", &gst_rtp::RTPProfile::Avpf),
     ]);
+
+    // Provide a pre-configured rtprtxsend so retransmits use the exact PT
+    // (101) and SSRC (2223) declared by the frontend's rtpParameters. The
+    // default rtpbin-built RTX element picks values mediasoup doesn't
+    // recognize, so it discards every retransmit.
+    //
+    // rtpbin expects the aux sender to be a Bin exposing ghost pads named
+    // `sink_<session>` and `src_<session>`. A bare rtprtxsend exposes only
+    // `sink` / `src`, so rtpbin can't link `send_rtp_sink_0` to it.
+    rtpbin.connect("request-aux-sender", false, |args| {
+        let session: u32 = args[1].get().unwrap_or(0);
+
+        let rtxsend = match gst::ElementFactory::make("rtprtxsend").build() {
+            Ok(el) => el,
+            Err(e) => {
+                eprintln!("[GStreamer] Failed to build rtprtxsend: {:?}", e);
+                return None;
+            }
+        };
+
+        let pt_map = gst::Structure::builder("application/x-rtp-pt-map")
+            .field("100", 101u32)
+            .build();
+        rtxsend.set_property("payload-type-map", &pt_map);
+
+        let ssrc_map = gst::Structure::builder("application/x-rtp-ssrc-map")
+            .field("2222", 2223u32)
+            .build();
+        rtxsend.set_property("ssrc-map", &ssrc_map);
+
+        // Retain ~1 s of sent packets for retransmission. Default is 100
+        // packets which at ~1300 pkt/s holds only ~77 ms of history — too
+        // short for any NACK that takes longer than a fast RTT to come back.
+        // Late NACKs hit an empty buffer and the loss escalates to PLI.
+        rtxsend.set_property("max-size-time", 1000u32);
+        rtxsend.set_property("max-size-packets", 0u32); // disable packet-count cap
+
+        let bin = gst::Bin::new();
+        if let Err(e) = bin.add(&rtxsend) {
+            eprintln!("[GStreamer] Failed to add rtprtxsend to aux bin: {:?}", e);
+            return None;
+        }
+
+        let sink_target = match rtxsend.static_pad("sink") {
+            Some(p) => p,
+            None => {
+                eprintln!("[GStreamer] rtprtxsend has no sink pad");
+                return None;
+            }
+        };
+        let src_target = match rtxsend.static_pad("src") {
+            Some(p) => p,
+            None => {
+                eprintln!("[GStreamer] rtprtxsend has no src pad");
+                return None;
+            }
+        };
+
+        let sink_ghost = gst::GhostPad::builder_with_target(&sink_target)
+            .map(|b| b.name(format!("sink_{}", session)).build())
+            .ok();
+        let src_ghost = gst::GhostPad::builder_with_target(&src_target)
+            .map(|b| b.name(format!("src_{}", session)).build())
+            .ok();
+
+        let (sink_ghost, src_ghost) = match (sink_ghost, src_ghost) {
+            (Some(s), Some(r)) => (s, r),
+            _ => {
+                eprintln!("[GStreamer] Failed to build ghost pads for aux sender");
+                return None;
+            }
+        };
+
+        if bin.add_pad(&sink_ghost).is_err() || bin.add_pad(&src_ghost).is_err() {
+            eprintln!("[GStreamer] Failed to add ghost pads to aux bin");
+            return None;
+        }
+
+        Some(glib::Value::from(&bin))
+    });
 
     // Configure source based on type. Enum-typed properties on plugin
     // elements (e.g. videotestsrc.pattern) must be set via the nick string —
@@ -301,16 +425,19 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
         src.set_property("is-live", true);
     }
 
-    // Tuned for 1080p60 game streaming: high bitrate, "faster" preset for
-    // motion sharpness, zerolatency to keep glass-to-glass low, no B-frames.
-    // psy-tune=film preserves perceptual detail in fast scenes.
+    // iperf3 confirmed the link carries 30 Mbps UDP cleanly with 0% loss to
+    // this server — so packet loss in the pipeline is not a bandwidth problem,
+    // it's a burstiness problem. x264 emits an entire frame as a single send;
+    // an IDR at 60 fps can dump ~200 KB into the socket in microseconds and
+    // overflow whatever queue (router, kernel, mediasoup recv buffer) sits at
+    // the bottleneck — even though the average rate fits comfortably.
     //
-    // Bitrate target: matching Discord's 12 Mbps@720p60 visual quality at
-    // 1080p60 needs ~27 Mbps for the 2.25× pixel count, plus ~25% headroom
-    // for zerolatency's efficiency penalty. 35 Mbps comfortably exceeds it
-    // for sharp motion in dynamic scenes. Stays within H.264 Level 4.2's
-    // 50 Mbps ceiling.
-    x264enc.set_property("bitrate", 35000u32); // 35 Mbps
+    // 10 Mbps target leaves 3× headroom under the link's clean ceiling.
+    // vbv-buf-capacity=400 ms (down from default 600) tightens the rate-control
+    // window so per-frame size variance is bounded — IDRs and scene changes
+    // can't blow out into a single megaburst.
+    x264enc.set_property("bitrate", 12000u32); // 12 Mbps
+    x264enc.set_property("vbv-buf-capacity", 400u32);
     x264enc.set_property_from_str("speed-preset", "faster");
     x264enc.set_property_from_str("psy-tune", "film");
     x264enc.set_property_from_str("tune", "zerolatency");
@@ -335,6 +462,10 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
         ("port", &(rtp_port as i32)),
         ("sync", &false),
         ("async", &false),
+        // 4 MB SO_SNDBUF — gives the kernel headroom to absorb whole-frame
+        // bursts the encoder hands us in a single write, instead of dropping
+        // packets on a full socket queue.
+        ("buffer-size", &4_194_304i32),
     ]);
 
     rtcp_sink.set_properties(&[
@@ -404,6 +535,78 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
         src_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, caps_probe_cb);
     }
 
+    // === Diagnostic instrumentation ===
+    // Counters incremented from probes; reset every second by the stats thread.
+    // The relative rates (encoder fps vs payloader pps vs udp pps) localize a
+    // freeze: if all stay nominal but the receiver still freezes, the loss is
+    // in transit and will show up as fraction-lost in the rtpsession stats.
+    let counters = Arc::new(StreamCounters::new());
+
+    if let Some(pad) = x264enc.static_pad("src") {
+        let c = counters.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+            if info.buffer().is_some() {
+                c.enc_buffers.fetch_add(1, Ordering::Relaxed);
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+
+    // rtph264pay (and downstream udpsink) emit RTP packets as buffer-lists
+    // — one list per frame containing each MTU-sized fragment. A BUFFER-only
+    // probe misses them entirely, undercounting by ~3×, so we accept both.
+    if let Some(pad) = rtph264pay.static_pad("src") {
+        let c = counters.clone();
+        pad.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+            move |_pad, info| {
+                if let Some(buf) = info.buffer() {
+                    c.pay_buffers.fetch_add(1, Ordering::Relaxed);
+                    c.pay_bytes.fetch_add(buf.size() as u64, Ordering::Relaxed);
+                } else if let Some(list) = info.buffer_list() {
+                    let mut n: u64 = 0;
+                    let mut b: u64 = 0;
+                    list.foreach(|buf, _idx| {
+                        n += 1;
+                        b += buf.size() as u64;
+                        std::ops::ControlFlow::Continue(())
+                    });
+                    c.pay_buffers.fetch_add(n, Ordering::Relaxed);
+                    c.pay_bytes.fetch_add(b, Ordering::Relaxed);
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+    }
+
+    if let Some(pad) = rtp_sink.static_pad("sink") {
+        let c = counters.clone();
+        pad.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+            move |_pad, info| {
+                if let Some(buf) = info.buffer() {
+                    c.udp_buffers.fetch_add(1, Ordering::Relaxed);
+                    c.udp_bytes.fetch_add(buf.size() as u64, Ordering::Relaxed);
+                } else if let Some(list) = info.buffer_list() {
+                    let mut n: u64 = 0;
+                    let mut b: u64 = 0;
+                    list.foreach(|buf, _idx| {
+                        n += 1;
+                        b += buf.size() as u64;
+                        std::ops::ControlFlow::Continue(())
+                    });
+                    c.udp_buffers.fetch_add(n, Ordering::Relaxed);
+                    c.udp_bytes.fetch_add(b, Ordering::Relaxed);
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+    }
+
+    // (RTCP-from-peer arrival is observable via the rtpsession stats: the
+    // `sent-rb-*` fields update only when an RR is received, so a frozen
+    // round-trip / fractionlost across multiple polls means feedback is silent.)
+
     // Set up bus watching
     let bus = pipeline.bus().unwrap();
     let bus_watch_guard = bus.add_watch(bus_call)
@@ -449,10 +652,59 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
         main_loop_clone.run();
     });
 
+    // Stats logger — once per second, prints per-stage rates (so you can see
+    // exactly which stage stalls during a freeze) and the rtpsession stats
+    // structure, which carries the receiver-reported fraction-lost / jitter /
+    // round-trip extracted from incoming RTCP RR packets.
+    let stats_stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stats_stop.clone();
+    let counters_clone = counters.clone();
+    let rtpbin_clone = rtpbin.clone();
+    std::thread::spawn(move || {
+        let mut prev = Instant::now();
+        while !stop_clone.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(1));
+            if stop_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            let now = Instant::now();
+            let dt = now.duration_since(prev).as_secs_f64().max(0.001);
+            prev = now;
+
+            let enc = counters_clone.enc_buffers.swap(0, Ordering::Relaxed);
+            let pay = counters_clone.pay_buffers.swap(0, Ordering::Relaxed);
+            let pay_b = counters_clone.pay_bytes.swap(0, Ordering::Relaxed);
+            let udp = counters_clone.udp_buffers.swap(0, Ordering::Relaxed);
+            let udp_b = counters_clone.udp_bytes.swap(0, Ordering::Relaxed);
+
+            eprintln!(
+                "[rate dt={:.2}s] enc={:.1}fps  pay={:.0}pkt/s ({:.2}Mbps)  udp={:.0}pkt/s ({:.2}Mbps)",
+                dt,
+                enc as f64 / dt,
+                pay as f64 / dt,
+                (pay_b as f64 * 8.0 / 1_000_000.0) / dt,
+                udp as f64 / dt,
+                (udp_b as f64 * 8.0 / 1_000_000.0) / dt,
+            );
+
+            // get-internal-session is an action signal — thread-safe to invoke
+            // off the streaming thread; the returned RTPSession's "stats"
+            // property snapshot is updated as RTCP arrives.
+            let session_obj = rtpbin_clone.emit_by_name::<glib::Object>(
+                "get-internal-session",
+                &[&0u32],
+            );
+            let stats: gst::Structure = session_obj.property("stats");
+            eprintln!("[rtpsession-0] {}", stats.to_string());
+        }
+        eprintln!("[stats] logger thread exiting");
+    });
+
     // Store state
     state.pipeline = Some(pipeline);
     state.bus_watch_guard = Some(bus_watch_guard);
     state.main_loop = Some(main_loop);
+    state.stats_stop = Some(stats_stop);
 
     Ok(())
 }
@@ -460,6 +712,10 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
 // Cleanup function
 pub fn cleanup() {
     let mut state = STATE.lock().unwrap();
+
+    if let Some(stop) = state.stats_stop.take() {
+        stop.store(true, Ordering::Relaxed);
+    }
 
     if let Some(pipeline) = state.pipeline.take() {
         if let Some(bus_watch_guard) = state.bus_watch_guard.take() {

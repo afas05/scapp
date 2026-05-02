@@ -10,7 +10,9 @@ import {
 
 // Must match rtph264pay properties in src-tauri/src/gstreamer.rs
 const VIDEO_PAYLOAD_TYPE = 100;
+const VIDEO_RTX_PAYLOAD_TYPE = 101;
 const VIDEO_SSRC = 2222;
+const VIDEO_RTX_SSRC = 2223;
 const VIDEO_CLOCK_RATE = 90000;
 
 export function useMediaSoup() {
@@ -67,24 +69,39 @@ export function useMediaSoup() {
         // 2. Declare the producer to mediasoup. profile-level-id MUST match
         //    the router's H264 codec config exactly — mediasoup's isSameProfile
         //    rejects mismatches even outside strict mode.
+        // Declares both the primary H.264 codec and its RTX (RFC 4588)
+        // sidecar so mediasoup will accept retransmissions sent by our
+        // pipeline. Without the RTX codec entry, mediasoup silently discards
+        // any packet on the RTX SSRC — we'd burn upload bandwidth on
+        // retransmits that never reach the consumer.
         const rtpParameters = {
-            codecs: [{
-                mimeType: 'video/H264',
-                payloadType: VIDEO_PAYLOAD_TYPE,
-                clockRate: VIDEO_CLOCK_RATE,
-                parameters: {
-                    'packetization-mode': 1,
-                    'profile-level-id': '42e01f', // baseline
-                    'level-asymmetry-allowed': 1,
+            codecs: [
+                {
+                    mimeType: 'video/H264',
+                    payloadType: VIDEO_PAYLOAD_TYPE,
+                    clockRate: VIDEO_CLOCK_RATE,
+                    parameters: {
+                        'packetization-mode': 1,
+                        'profile-level-id': '42e01f', // baseline
+                        'level-asymmetry-allowed': 1,
+                    },
+                    rtcpFeedback: [
+                        { type: 'nack' },
+                        { type: 'nack', parameter: 'pli' },
+                        { type: 'goog-remb' },
+                        { type: 'transport-cc' },
+                    ],
                 },
-                rtcpFeedback: [
-                    { type: 'nack' },
-                    { type: 'nack', parameter: 'pli' },
-                    { type: 'goog-remb' },
-                    { type: 'transport-cc' },
-                ],
-            }],
-            encodings: [{ ssrc: VIDEO_SSRC }],
+                {
+                    mimeType: 'video/rtx',
+                    payloadType: VIDEO_RTX_PAYLOAD_TYPE,
+                    clockRate: VIDEO_CLOCK_RATE,
+                    parameters: {
+                        apt: VIDEO_PAYLOAD_TYPE,
+                    },
+                },
+            ],
+            encodings: [{ ssrc: VIDEO_SSRC, rtx: { ssrc: VIDEO_RTX_SSRC } }],
             rtcp: { cname: 'gstreamer' },
         };
 
