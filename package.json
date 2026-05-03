@@ -1,20 +1,23 @@
 {
   "name": "scapp",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "version:bump": "node scripts/bump-version.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",
     "@tauri-apps/plugin-http": "^2.4.4",
     "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-process": "^2",
     "@tauri-apps/plugin-shell": "^2.2.1",
     "@tauri-apps/plugin-store": "^2.0.0",
+    "@tauri-apps/plugin-updater": "^2",
     "@tauri-apps/plugin-websocket": "^2.3.0",
     "flatbuffers": "^25.9.23",
     "kiss-rpc-fb": "^1.0.0",

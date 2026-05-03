@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "scapp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.scapp.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -28,13 +28,34 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "nsis"
+    ],
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/kitava.ico"
-    ]
+    ],
+    "resources": {
+      "gstreamer/bin/*.dll": "./",
+      "gstreamer/plugins/*.dll": "gstreamer-1.0/"
+    },
+    "windows": {
+      "nsis": {}
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU3NjNDMDA1Q0JDQkI0RQpSV1JPdTd4Y0FEeDJEaCtZQ3kxbzN2Szd3d1A1dHhiVVlhWVZvbVhqSDY4amtneUxYT2FYVGN3TQo=",
+      "endpoints": [
+        "https://github.com/afas05/scapp/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

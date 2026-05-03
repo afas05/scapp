@@ -1,6 +1,6 @@
 [package]
 name = "scapp"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -26,6 +26,8 @@ tauri-plugin-websocket = "2"
 tauri-plugin-http = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-store = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 gstreamer = "0.21.1"
 gstreamer-rtp = "0.21.1"
 gstreamer-video = "0.21.1"

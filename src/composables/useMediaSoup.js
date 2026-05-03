@@ -15,13 +15,20 @@ const VIDEO_SSRC = 2222;
 const VIDEO_RTX_SSRC = 2223;
 const VIDEO_CLOCK_RATE = 90000;
 
+// Must match rtpopuspay properties in src-tauri/src/gstreamer.rs
+const AUDIO_PAYLOAD_TYPE = 96;
+const AUDIO_SSRC = 1111;
+const AUDIO_CLOCK_RATE = 48000;
+const AUDIO_CHANNELS = 2;
+
 export function useMediaSoup() {
     const isConnected = ref(false);
     const viewerCount = ref(0);
 
     let rpc = null;
     let closeTransport = null;
-    let producerId = null;
+    let videoProducerId = null;
+    let audioProducerId = null;
     let pipelineRunning = false;
 
     let onStreamEnded = null;
@@ -56,25 +63,27 @@ export function useMediaSoup() {
     }
 
     async function startSharing() {
-        // 1. Ask SFU for a PlainTransport (comedia=true; we just send RTP at it).
-        const ptResp = await rpc.request(
+        // 1a. Video PlainTransport (comedia=true; we just send RTP at it).
+        const videoPt = await rpc.request(
             Method.CreateProducerPlainTransport,
-            new CreateProducerPlainTransportRequestT(),
+            new CreateProducerPlainTransportRequestT('video'),
         );
 
-        const host = ptResp.ip();
-        const rtpPort = ptResp.port();
-        const rtcpPort = ptResp.rtcpPort();
+        // 1b. Audio PlainTransport on the same WS session — separate UDP port pair.
+        const audioPt = await rpc.request(
+            Method.CreateProducerPlainTransport,
+            new CreateProducerPlainTransportRequestT('audio'),
+        );
 
-        // 2. Declare the producer to mediasoup. profile-level-id MUST match
-        //    the router's H264 codec config exactly — mediasoup's isSameProfile
-        //    rejects mismatches even outside strict mode.
-        // Declares both the primary H.264 codec and its RTX (RFC 4588)
-        // sidecar so mediasoup will accept retransmissions sent by our
-        // pipeline. Without the RTX codec entry, mediasoup silently discards
-        // any packet on the RTX SSRC — we'd burn upload bandwidth on
-        // retransmits that never reach the consumer.
-        const rtpParameters = {
+        // 2a. Declare the video producer to mediasoup. profile-level-id MUST
+        //     match the router's H264 codec config exactly — mediasoup's
+        //     isSameProfile rejects mismatches even outside strict mode.
+        //     Declares both the primary H.264 codec and its RTX (RFC 4588)
+        //     sidecar so mediasoup will accept retransmissions sent by our
+        //     pipeline. Without the RTX codec entry, mediasoup silently
+        //     discards any packet on the RTX SSRC — we'd burn upload bandwidth
+        //     on retransmits that never reach the consumer.
+        const videoRtpParameters = {
             codecs: [
                 {
                     mimeType: 'video/H264',
@@ -105,24 +114,49 @@ export function useMediaSoup() {
             rtcp: { cname: 'gstreamer' },
         };
 
-        const produceResp = await rpc.request(
+        const videoProduceResp = await rpc.request(
             Method.Produce,
-            new ProduceRequestT('video', JSON.stringify(rtpParameters)),
+            new ProduceRequestT('video', JSON.stringify(videoRtpParameters)),
         );
-        producerId = produceResp.id();
+        videoProducerId = videoProduceResp.id();
 
-        // 3. Spin up the native GStreamer pipeline targeting the SFU's plain
-        //    transport. comedia=true means the SFU latches onto whatever
-        //    source ip:port our RTP arrives from — no connect step needed.
+        // 2b. Declare the audio producer (Opus 48kHz stereo).
+        const audioRtpParameters = {
+            codecs: [
+                {
+                    mimeType: 'audio/opus',
+                    payloadType: AUDIO_PAYLOAD_TYPE,
+                    clockRate: AUDIO_CLOCK_RATE,
+                    channels: AUDIO_CHANNELS,
+                },
+            ],
+            encodings: [{ ssrc: AUDIO_SSRC }],
+            rtcp: { cname: 'gstreamer' },
+        };
+
+        const audioProduceResp = await rpc.request(
+            Method.Produce,
+            new ProduceRequestT('audio', JSON.stringify(audioRtpParameters)),
+        );
+        audioProducerId = audioProduceResp.id();
+
+        // 3. Spin up the native GStreamer pipeline targeting both PlainTransports.
+        //    comedia=true means the SFU latches onto whatever source ip:port our
+        //    RTP arrives from — no connect step needed for either kind.
         await invoke('start_stream', {
-            host,
-            rtpPort,
-            rtcpPort,
+            videoHost: videoPt.ip(),
+            videoRtpPort: videoPt.port(),
+            videoRtcpPort: videoPt.rtcpPort(),
+            audioHost: audioPt.ip(),
+            audioRtpPort: audioPt.port(),
+            audioRtcpPort: audioPt.rtcpPort(),
         });
 
         pipelineRunning = true;
 
-        if (onProducerCreated) onProducerCreated(produceResp.id(), produceResp.userSession());
+        // The viewer subscribes to the video producer id; audio is paired by
+        // the SFU under the same session. Surface the video id to the UI.
+        if (onProducerCreated) onProducerCreated(videoProduceResp.id(), videoProduceResp.userSession());
     }
 
     async function stopProducing() {
@@ -130,10 +164,13 @@ export function useMediaSoup() {
             try { await invoke('stop_stream'); } catch (e) { console.error('[MediaSoup] stop_stream failed:', e); }
             pipelineRunning = false;
         }
-        if (rpc && producerId) {
+        // A single ProducerClosed tears down both producers + transports for
+        // the session on the SFU.
+        if (rpc && (videoProducerId || audioProducerId)) {
             rpc.notify(Method.ProducerClosed, new ProducerClosedRequestT());
         }
-        producerId = null;
+        videoProducerId = null;
+        audioProducerId = null;
         if (onProducerClosed) onProducerClosed();
     }
 

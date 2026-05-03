@@ -89,7 +89,9 @@ table ViewerCountRequest {
 table StreamEndedRequest {}
 
 // --- CreateProducerPlainTransport (PlainTransport with comedia=true; no connect step) ---
-table CreateProducerPlainTransportRequest {}
+table CreateProducerPlainTransportRequest {
+    kind: string;        // "audio" | "video" — which kind this transport will carry
+}
 
 table CreateProducerPlainTransportResponse {
     id: string;

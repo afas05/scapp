@@ -4,7 +4,6 @@ use glib;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use std::env;
 use glib::ObjectExt;
 use gstreamer::prelude::{ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual, GstObjectExt, PadExtManual};
 
@@ -31,8 +30,10 @@ impl StreamCounters {
 }
 
 // Constants
-const LOCAL_RTCP_PORT: i32 = 5003;
+const LOCAL_VIDEO_RTCP_PORT: i32 = 5003;
+const LOCAL_AUDIO_RTCP_PORT: i32 = 5005;
 const VIDEO_SSRC: u32 = 2222;
+const AUDIO_SSRC: u32 = 1111;
 
 // Global state structure
 struct GstreamerState {
@@ -59,39 +60,6 @@ lazy_static::lazy_static! {
     static ref GSTREAMER_INITIALIZED: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 }
 
-// Set up GStreamer environment
-fn setup_gstreamer_environment() -> Result<(), String> {
-    // Get the executable directory
-    let exe_dir = match env::current_exe() {
-        Ok(exe_path) => match exe_path.parent() {
-            Some(dir) => dir.to_path_buf(),
-            None => return Err("Failed to get executable directory".to_string()),
-        },
-        Err(e) => return Err(format!("Failed to get executable path: {}", e)),
-    };
-
-    // Set up GStreamer plugin path
-    let gst_plugin_path = exe_dir.join("gstreamer").join("lib").join("gstreamer-1.0");
-    println!("Setting GST_PLUGIN_PATH to: {}", gst_plugin_path.display());
-    env::set_var("GST_PLUGIN_PATH", gst_plugin_path.to_string_lossy().to_string());
-
-    // Add GStreamer bin directory to PATH
-    let gst_bin_path = exe_dir.join("gstreamer").join("bin");
-    println!("Adding to PATH: {}", gst_bin_path.display());
-
-    // Get current PATH
-    let path_var = match env::var("PATH") {
-        Ok(path) => path,
-        Err(e) => return Err(format!("Failed to get PATH environment variable: {}", e)),
-    };
-
-    // Prepend GStreamer bin path to PATH
-    let new_path = format!("{};{}", gst_bin_path.to_string_lossy(), path_var);
-    env::set_var("PATH", new_path);
-
-    Ok(())
-}
-
 // Initialize GStreamer (can only be called once per process)
 pub fn init() -> Result<(), String> {
     // Check if already initialized
@@ -102,9 +70,6 @@ pub fn init() -> Result<(), String> {
             return Ok(());
         }
     }
-
-    // Set up GStreamer environment
-    setup_gstreamer_environment()?;
 
     // Initialize GStreamer (this can only be called once per process)
     match gst::init() {
@@ -202,7 +167,14 @@ fn bus_call(_bus: &gst::Bus, msg: &gst::Message) -> glib::ControlFlow {
 }
 
 // Create and start the GStreamer pipeline
-pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> Result<(), String> {
+pub fn create_gstreamer_pipeline(
+    video_host: &str,
+    video_rtp_port: u16,
+    video_rtcp_port: u16,
+    audio_host: &str,
+    audio_rtp_port: u16,
+    audio_rtcp_port: u16,
+) -> Result<(), String> {
     // Initialize GStreamer if not already initialized
     if let Err(e) = init() {
         return Err(e);
@@ -283,7 +255,7 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
         .build()
         .map_err(|_| "Failed to create rtph264pay element".to_string())?;
 
-    // Create network elements
+    // Video network elements
     let rtp_sink = gst::ElementFactory::make("udpsink")
         .name("rtp_sink")
         .build()
@@ -298,6 +270,56 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
         .name("rtcp_src")
         .build()
         .map_err(|_| "Failed to create udpsrc element".to_string())?;
+
+    // Audio capture + encode chain. wasapi2src loopback=true captures the
+    // system audio mix (what's playing on the streamer's speakers) — same
+    // semantics as a screen capture for the audio side. low-latency=true
+    // keeps the WASAPI buffer small so audio doesn't drift behind video.
+    let audio_src = gst::ElementFactory::make("wasapi2src")
+        .name("wasapi2src")
+        .build()
+        .map_err(|_| "Failed to create wasapi2src element".to_string())?;
+
+    let audioconvert = gst::ElementFactory::make("audioconvert")
+        .name("audioconvert")
+        .build()
+        .map_err(|_| "Failed to create audioconvert element".to_string())?;
+
+    let audioresample = gst::ElementFactory::make("audioresample")
+        .name("audioresample")
+        .build()
+        .map_err(|_| "Failed to create audioresample element".to_string())?;
+
+    let opus_capsfilter = gst::ElementFactory::make("capsfilter")
+        .name("opus_capsfilter")
+        .build()
+        .map_err(|_| "Failed to create opus capsfilter element".to_string())?;
+
+    let opusenc = gst::ElementFactory::make("opusenc")
+        .name("opusenc")
+        .build()
+        .map_err(|_| "Failed to create opusenc element".to_string())?;
+
+    let rtpopuspay = gst::ElementFactory::make("rtpopuspay")
+        .name("rtpopuspay")
+        .build()
+        .map_err(|_| "Failed to create rtpopuspay element".to_string())?;
+
+    // Audio network elements (separate UDP socket pair from video).
+    let audio_rtp_sink = gst::ElementFactory::make("udpsink")
+        .name("audio_rtp_sink")
+        .build()
+        .map_err(|_| "Failed to create audio udpsink element".to_string())?;
+
+    let audio_rtcp_sink = gst::ElementFactory::make("udpsink")
+        .name("audio_rtcp_sink")
+        .build()
+        .map_err(|_| "Failed to create audio rtcp udpsink element".to_string())?;
+
+    let audio_rtcp_src = gst::ElementFactory::make("udpsrc")
+        .name("audio_rtcp_src")
+        .build()
+        .map_err(|_| "Failed to create audio rtcp udpsrc element".to_string())?;
 
     // 1080p60 output. d3d12screencapturesrc captures at native screen
     // resolution; videoscale handles down/up-scaling to this target.
@@ -317,6 +339,32 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
         .build();
 
     h264_capsfilter.set_property("caps", &h264_caps);
+
+    // Force opusenc into the exact capsline mediasoup expects on the wire:
+    // 48 kHz, 2 channels. wasapi2src loopback typically produces F32LE at the
+    // device rate (often 48 kHz already), but if the device clock differs
+    // audioresample handles the conversion before this filter.
+    let opus_in_caps = gst::Caps::builder("audio/x-raw")
+        .field("rate", 48000i32)
+        .field("channels", 2i32)
+        .build();
+    opus_capsfilter.set_property("caps", &opus_in_caps);
+
+    // Loopback capture of the default render endpoint (system mix). The
+    // existing screen-capture mirror: viewers hear what the streamer hears.
+    audio_src.set_property("loopback", true);
+    audio_src.set_property("low-latency", true);
+
+    // 128 kbps stereo Opus tuned for general audio. frame-size=20 ms is the
+    // common WebRTC default and matches what browser consumers expect.
+    opusenc.set_property("bitrate", 128_000i32);
+    opusenc.set_property_from_str("audio-type", "generic");
+    opusenc.set_property("inband-fec", true);
+    opusenc.set_property("packet-loss-percentage", 5i32);
+
+    rtpopuspay.set_property("ssrc", AUDIO_SSRC);
+    rtpopuspay.set_property("pt", 96u32); // Must match audio payloadType in useMediaSoup.js
+    rtpopuspay.set_property("mtu", 1400u32);
 
     // Configure rtpbin for mediasoup compatibility.
     // ntp-time-source defaults to "ntp" (NTP time based on realtime clock),
@@ -341,13 +389,24 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
     // `sink_<session>` and `src_<session>`. A bare rtprtxsend exposes only
     // `sink` / `src`, so rtpbin can't link `send_rtp_sink_0` to it.
     rtpbin.connect("request-aux-sender", false, |args| {
+        // glib-rs marshals "no aux element" as a Value of type GstElement
+        // holding NULL — returning bare Rust None panics the closure
+        // marshaller because the signal's declared return type is GstElement.
+        let no_aux = || Some(glib::value::ToValue::to_value(&None::<gst::Element>));
+
         let session: u32 = args[1].get().unwrap_or(0);
+
+        // Only the video session (0) carries an RTX sidecar. Audio is Opus
+        // with no RTX codec declared on the consumer side.
+        if session != 0 {
+            return no_aux();
+        }
 
         let rtxsend = match gst::ElementFactory::make("rtprtxsend").build() {
             Ok(el) => el,
             Err(e) => {
                 eprintln!("[GStreamer] Failed to build rtprtxsend: {:?}", e);
-                return None;
+                return no_aux();
             }
         };
 
@@ -371,21 +430,21 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
         let bin = gst::Bin::new();
         if let Err(e) = bin.add(&rtxsend) {
             eprintln!("[GStreamer] Failed to add rtprtxsend to aux bin: {:?}", e);
-            return None;
+            return no_aux();
         }
 
         let sink_target = match rtxsend.static_pad("sink") {
             Some(p) => p,
             None => {
                 eprintln!("[GStreamer] rtprtxsend has no sink pad");
-                return None;
+                return no_aux();
             }
         };
         let src_target = match rtxsend.static_pad("src") {
             Some(p) => p,
             None => {
                 eprintln!("[GStreamer] rtprtxsend has no src pad");
-                return None;
+                return no_aux();
             }
         };
 
@@ -400,13 +459,13 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
             (Some(s), Some(r)) => (s, r),
             _ => {
                 eprintln!("[GStreamer] Failed to build ghost pads for aux sender");
-                return None;
+                return no_aux();
             }
         };
 
         if bin.add_pad(&sink_ghost).is_err() || bin.add_pad(&src_ghost).is_err() {
             eprintln!("[GStreamer] Failed to add ghost pads to aux bin");
-            return None;
+            return no_aux();
         }
 
         Some(glib::Value::from(&bin))
@@ -436,7 +495,7 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
     // vbv-buf-capacity=400 ms (down from default 600) tightens the rate-control
     // window so per-frame size variance is bounded — IDRs and scene changes
     // can't blow out into a single megaburst.
-    x264enc.set_property("bitrate", 12000u32); // 12 Mbps
+    x264enc.set_property("bitrate", 20000u32); // 20 Mbps
     x264enc.set_property("vbv-buf-capacity", 400u32);
     x264enc.set_property_from_str("speed-preset", "faster");
     x264enc.set_property_from_str("psy-tune", "film");
@@ -458,8 +517,8 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
     rtph264pay.set_property_from_str("aggregate-mode", "zero-latency");
 
     rtp_sink.set_properties(&[
-        ("host", &host),
-        ("port", &(rtp_port as i32)),
+        ("host", &video_host),
+        ("port", &(video_rtp_port as i32)),
         ("sync", &false),
         ("async", &false),
         // 4 MB SO_SNDBUF — gives the kernel headroom to absorb whole-frame
@@ -469,16 +528,39 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
     ]);
 
     rtcp_sink.set_properties(&[
-        ("host", &host),
-        ("port", &(rtcp_port as i32)),
+        ("host", &video_host),
+        ("port", &(video_rtcp_port as i32)),
         ("sync", &false),
         ("async", &false),
         ("buffer-size", &4_194_304i32),
     ]);
 
     rtcp_src.set_properties(&[
-        ("port", &LOCAL_RTCP_PORT),
+        ("port", &LOCAL_VIDEO_RTCP_PORT),
         ("buffer-size", &1_048_576i32),
+    ]);
+
+    // Audio sinks/source — separate UDP sockets, smaller send buffer is fine
+    // (Opus at 128 kbps is ~16 KB/s, no burstiness like H.264 IDRs).
+    audio_rtp_sink.set_properties(&[
+        ("host", &audio_host),
+        ("port", &(audio_rtp_port as i32)),
+        ("sync", &false),
+        ("async", &false),
+        ("buffer-size", &262_144i32),
+    ]);
+
+    audio_rtcp_sink.set_properties(&[
+        ("host", &audio_host),
+        ("port", &(audio_rtcp_port as i32)),
+        ("sync", &false),
+        ("async", &false),
+        ("buffer-size", &262_144i32),
+    ]);
+
+    audio_rtcp_src.set_properties(&[
+        ("port", &LOCAL_AUDIO_RTCP_PORT),
+        ("buffer-size", &262_144i32),
     ]);
 
     // Add elements to pipeline
@@ -486,6 +568,8 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
         &rtpbin, &src, &videoconvert, &videoscale,
         &x264enc, &h264_capsfilter, &rtph264pay, &rtp_sink,
         &rtcp_sink, &rtcp_src, &capsfilter,
+        &audio_src, &audioconvert, &audioresample, &opus_capsfilter,
+        &opusenc, &rtpopuspay, &audio_rtp_sink, &audio_rtcp_sink, &audio_rtcp_src,
     ]).map_err(|_| "Failed to add elements to pipeline".to_string())?;
 
     // d3d12screencapturesrc emits memory:D3D12Memory caps, which videoconvert can't accept.
@@ -529,6 +613,26 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
 
     rtcp_src.link_pads(Some("src"), &rtpbin, Some("recv_rtcp_sink_0"))
         .map_err(|e| format!("Failed to link rtcp_src to rtpbin: {:?}", e))?;
+
+    // Audio chain: capture → convert/resample → 48k/2ch caps → opus encode → RTP payload
+    gst::Element::link_many(&[
+        &audio_src, &audioconvert, &audioresample, &opus_capsfilter,
+        &opusenc, &rtpopuspay,
+    ]).map_err(|e| format!("Failed to link audio elements: {:?}", e))?;
+
+    // Audio rides session 1 on the same rtpbin instance — keeps per-session
+    // SR/RR bookkeeping isolated from video while reusing one main loop / clock.
+    rtpopuspay.link_pads(Some("src"), &rtpbin, Some("send_rtp_sink_1"))
+        .map_err(|e| format!("Failed to link rtpopuspay to rtpbin: {:?}", e))?;
+
+    rtpbin.link_pads(Some("send_rtp_src_1"), &audio_rtp_sink, Some("sink"))
+        .map_err(|e| format!("Failed to link rtpbin to audio_rtp_sink: {:?}", e))?;
+
+    rtpbin.link_pads(Some("send_rtcp_src_1"), &audio_rtcp_sink, Some("sink"))
+        .map_err(|e| format!("Failed to link rtpbin to audio_rtcp_sink: {:?}", e))?;
+
+    audio_rtcp_src.link_pads(Some("src"), &rtpbin, Some("recv_rtcp_sink_1"))
+        .map_err(|e| format!("Failed to link audio_rtcp_src to rtpbin: {:?}", e))?;
 
     // Add caps probe for debugging
     if let Some(src_pad) = src.static_pad("src") {
@@ -623,6 +727,13 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
     rtcp_sink.set_property_from_value("socket", &rtcp_socket_value);
     rtcp_sink.set_property("close-socket", false);
 
+    // Same comedia socket-sharing for the audio RTCP pair.
+    audio_rtcp_src.set_state(gst::State::Ready)
+        .map_err(|e| format!("Failed to set audio_rtcp_src to Ready: {:?}", e))?;
+    let audio_rtcp_socket_value = audio_rtcp_src.property_value("used-socket");
+    audio_rtcp_sink.set_property_from_value("socket", &audio_rtcp_socket_value);
+    audio_rtcp_sink.set_property("close-socket", false);
+
     // Start playing
     let state_change_result = pipeline.set_state(gst::State::Playing);
     match state_change_result {
@@ -690,12 +801,19 @@ pub fn create_gstreamer_pipeline(host: &str, rtp_port: u16, rtcp_port: u16) -> R
             // get-internal-session is an action signal — thread-safe to invoke
             // off the streaming thread; the returned RTPSession's "stats"
             // property snapshot is updated as RTCP arrives.
-            let session_obj = rtpbin_clone.emit_by_name::<glib::Object>(
+            let video_session = rtpbin_clone.emit_by_name::<glib::Object>(
                 "get-internal-session",
                 &[&0u32],
             );
-            let stats: gst::Structure = session_obj.property("stats");
-            eprintln!("[rtpsession-0] {}", stats.to_string());
+            let video_stats: gst::Structure = video_session.property("stats");
+            eprintln!("[rtpsession-0/video] {}", video_stats.to_string());
+
+            let audio_session = rtpbin_clone.emit_by_name::<glib::Object>(
+                "get-internal-session",
+                &[&1u32],
+            );
+            let audio_stats: gst::Structure = audio_session.property("stats");
+            eprintln!("[rtpsession-1/audio] {}", audio_stats.to_string());
         }
         eprintln!("[stats] logger thread exiting");
     });
@@ -736,14 +854,26 @@ pub fn cleanup() {
 }
 
 // Start streaming function to be called from lib.rs
-pub fn start_streaming(host: String, rtp_port: u16, rtcp_port: u16) -> Result<String, String> {
-    // Initialize GStreamer
+pub fn start_streaming(
+    video_host: String,
+    video_rtp_port: u16,
+    video_rtcp_port: u16,
+    audio_host: String,
+    audio_rtp_port: u16,
+    audio_rtcp_port: u16,
+) -> Result<String, String> {
     init()?;
 
-    println!("host: {}, port: {}, rtcp_port: {}", host, rtp_port, rtcp_port);
+    println!(
+        "video {}:{}/{}  audio {}:{}/{}",
+        video_host, video_rtp_port, video_rtcp_port,
+        audio_host, audio_rtp_port, audio_rtcp_port,
+    );
 
-    // Create and start the pipeline
-    create_gstreamer_pipeline(&host, rtp_port, rtcp_port)?;
+    create_gstreamer_pipeline(
+        &video_host, video_rtp_port, video_rtcp_port,
+        &audio_host, audio_rtp_port, audio_rtcp_port,
+    )?;
 
     Ok("Streaming started successfully".to_string())
 }

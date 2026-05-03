@@ -8,18 +8,27 @@ export class CreateProducerPlainTransportRequest {
   static getRootAsCreateProducerPlainTransportRequest(bb:flatbuffers.ByteBuffer, obj?:CreateProducerPlainTransportRequest):CreateProducerPlainTransportRequest {
     return (obj || new CreateProducerPlainTransportRequest()).__init(bb.readInt32(bb.position()) + bb.position(), bb);
   }
-  static startCreateProducerPlainTransportRequest(builder:flatbuffers.Builder) { builder.startObject(0); }
+  kind():string|null
+  kind(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
+  kind(optionalEncoding?:any):string|Uint8Array|null {
+    const offset = this.bb!.__offset(this.bb_pos, 4);
+    return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
+  }
+  static startCreateProducerPlainTransportRequest(builder:flatbuffers.Builder) { builder.startObject(1); }
+  static addKind(builder:flatbuffers.Builder, o:flatbuffers.Offset) { builder.addFieldOffset(0, o, 0); }
   static endCreateProducerPlainTransportRequest(builder:flatbuffers.Builder):flatbuffers.Offset { return builder.endObject(); }
-  static createCreateProducerPlainTransportRequest(builder:flatbuffers.Builder):flatbuffers.Offset {
+  static createCreateProducerPlainTransportRequest(builder:flatbuffers.Builder, kindOffset:flatbuffers.Offset):flatbuffers.Offset {
     CreateProducerPlainTransportRequest.startCreateProducerPlainTransportRequest(builder);
+    CreateProducerPlainTransportRequest.addKind(builder, kindOffset);
     return CreateProducerPlainTransportRequest.endCreateProducerPlainTransportRequest(builder);
   }
-  unpack(): CreateProducerPlainTransportRequestT { return new CreateProducerPlainTransportRequestT(); }
-  unpackTo(_o: CreateProducerPlainTransportRequestT): void {}
+  unpack(): CreateProducerPlainTransportRequestT { return new CreateProducerPlainTransportRequestT(this.kind()); }
+  unpackTo(_o: CreateProducerPlainTransportRequestT): void { _o.kind = this.kind(); }
 }
 export class CreateProducerPlainTransportRequestT {
-  constructor(){}
+  constructor(public kind: string|Uint8Array|null = null){}
   pack(builder:flatbuffers.Builder): flatbuffers.Offset {
-    return CreateProducerPlainTransportRequest.createCreateProducerPlainTransportRequest(builder);
+    const kind = (this.kind !== null ? builder.createString(this.kind!) : 0);
+    return CreateProducerPlainTransportRequest.createCreateProducerPlainTransportRequest(builder, kind);
   }
 }
