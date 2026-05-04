@@ -33,16 +33,23 @@ jobs:
         shell: pwsh
         run: choco install -y --no-progress pkgconfiglite
 
-      - name: Download GStreamer MSIs from official release
+      - name: Download GStreamer MSIs from GitHub release
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GSTREAMER_VERSION/msvc"
           $runtime = "$env:RUNNER_TEMP\gstreamer-1.0-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
           $devel   = "$env:RUNNER_TEMP\gstreamer-1.0-devel-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
           Write-Host "Downloading runtime MSI..."
-          Invoke-WebRequest "$base/gstreamer-1.0-msvc-x86_64-$env:GSTREAMER_VERSION.msi" -OutFile $runtime
+          gh release download $env:GSTREAMER_VERSION `
+            --repo GStreamer/gstreamer `
+            --pattern "gstreamer-1.0-msvc-x86_64-$env:GSTREAMER_VERSION.msi" `
+            --dir $env:RUNNER_TEMP
           Write-Host "Downloading devel MSI..."
-          Invoke-WebRequest "$base/gstreamer-1.0-devel-msvc-x86_64-$env:GSTREAMER_VERSION.msi" -OutFile $devel
+          gh release download $env:GSTREAMER_VERSION `
+            --repo GStreamer/gstreamer `
+            --pattern "gstreamer-1.0-devel-msvc-x86_64-$env:GSTREAMER_VERSION.msi" `
+            --dir $env:RUNNER_TEMP
 
       - name: Install GStreamer (runtime + devel) MSIs
         shell: pwsh
