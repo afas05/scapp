@@ -52,7 +52,7 @@ jobs:
             $log = "$env:RUNNER_TEMP\$logName.log"
             Write-Host "==> Installing $path"
             $proc = Start-Process msiexec.exe `
-              -ArgumentList "/i", "`"$path`"", "/qn", "/norestart", "/l*v", "`"$log`"", "ADDLOCAL=ALL", "INSTALLDIR=C:\gstreamer\1.0\msvc_x86_64" `
+              -ArgumentList "/i", "`"$path`"", "/qn", "/norestart", "/l*v", "`"$log`"", "ADDLOCAL=ALL" `
               -Wait -PassThru
             Write-Host "msiexec exit code: $($proc.ExitCode)"
             if ($proc.ExitCode -ne 0) {
