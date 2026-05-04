@@ -9,7 +9,6 @@ on:
 env:
   GSTREAMER_VERSION: '1.24.13'
   GSTREAMER_ROOT: 'C:\gstreamer\1.0\msvc_x86_64'
-  GSTREAMER_DEPS_TAG: 'build-deps-gstreamer-1.24.13'
 
 jobs:
   build:
@@ -34,16 +33,16 @@ jobs:
         shell: pwsh
         run: choco install -y --no-progress pkgconfiglite
 
-      - name: Download GStreamer MSIs from build-deps release
+      - name: Download GStreamer MSIs from official release
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release download $env:GSTREAMER_DEPS_TAG `
-            --repo $env:GITHUB_REPOSITORY `
-            --dir $env:RUNNER_TEMP `
-            --pattern "gstreamer-1.0-msvc-x86_64-$env:GSTREAMER_VERSION.msi" `
-            --pattern "gstreamer-1.0-devel-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
+          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GSTREAMER_VERSION/msvc"
+          $runtime = "$env:RUNNER_TEMP\gstreamer-1.0-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
+          $devel   = "$env:RUNNER_TEMP\gstreamer-1.0-devel-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
+          Write-Host "Downloading runtime MSI..."
+          Invoke-WebRequest "$base/gstreamer-1.0-msvc-x86_64-$env:GSTREAMER_VERSION.msi" -OutFile $runtime
+          Write-Host "Downloading devel MSI..."
+          Invoke-WebRequest "$base/gstreamer-1.0-devel-msvc-x86_64-$env:GSTREAMER_VERSION.msi" -OutFile $devel
 
       - name: Install GStreamer (runtime + devel) MSIs
         shell: pwsh
