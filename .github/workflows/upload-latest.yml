@@ -1,0 +1,24 @@
+name: Upload Update Manifest
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  upload-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download latest.json from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "latest.json"
+
+      - name: Upload manifest to update server
+        run: |
+          curl --fail -X POST https://streamsnipe.live/releases/latest \
+            -H "Authorization: Bearer ${{ secrets.UPDATE_SERVER_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @latest.json
