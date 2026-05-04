@@ -48,10 +48,36 @@ jobs:
       - name: Install GStreamer (runtime + devel) MSIs
         shell: pwsh
         run: |
+          function Install-Msi($path, $logName) {
+            $log = "$env:RUNNER_TEMP\$logName.log"
+            Write-Host "==> Installing $path"
+            $proc = Start-Process msiexec.exe `
+              -ArgumentList "/i", "`"$path`"", "/qn", "/norestart", "/l*v", "`"$log`"", "ADDLOCAL=ALL", "INSTALLDIR=C:\gstreamer\1.0\msvc_x86_64" `
+              -Wait -PassThru
+            Write-Host "msiexec exit code: $($proc.ExitCode)"
+            if ($proc.ExitCode -ne 0) {
+              Write-Host "----- last 80 lines of $log -----"
+              if (Test-Path $log) { Get-Content $log -Tail 80 }
+              throw "MSI install failed: $path (exit $($proc.ExitCode))"
+            }
+          }
+
           $runtime = "$env:RUNNER_TEMP\gstreamer-1.0-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
           $devel   = "$env:RUNNER_TEMP\gstreamer-1.0-devel-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
-          Start-Process msiexec -ArgumentList "/i", $runtime, "/quiet", "/qn", "ADDLOCAL=ALL" -Wait
-          Start-Process msiexec -ArgumentList "/i", $devel,   "/quiet", "/qn", "ADDLOCAL=ALL" -Wait
+          Write-Host "Runtime MSI size: $((Get-Item $runtime).Length) bytes"
+          Write-Host "Devel   MSI size: $((Get-Item $devel).Length) bytes"
+
+          Install-Msi $runtime 'gst-runtime-install'
+          Install-Msi $devel   'gst-devel-install'
+
+          Write-Host "==> Listing C:\gstreamer (post-install)"
+          if (Test-Path C:\gstreamer) {
+            Get-ChildItem -Path C:\gstreamer -Recurse -Depth 3 -Directory | Select-Object -ExpandProperty FullName
+          } else {
+            Write-Host "C:\gstreamer does not exist. Searching for gstreamer-1.0-0.dll system-wide..."
+            Get-ChildItem -Path C:\ -Filter "gstreamer-1.0-0.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 5 -ExpandProperty FullName
+          }
+
           if (-not (Test-Path "$env:GSTREAMER_ROOT\bin\gstreamer-1.0-0.dll")) {
             Write-Error "GStreamer install missing: $env:GSTREAMER_ROOT not populated"
             exit 1
