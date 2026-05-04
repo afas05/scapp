@@ -33,23 +33,15 @@ jobs:
         shell: pwsh
         run: choco install -y --no-progress pkgconfiglite
 
-      - name: Download GStreamer MSIs from GitHub release
+      - name: Download GStreamer MSIs
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $runtime = "$env:RUNNER_TEMP\gstreamer-1.0-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
-          $devel   = "$env:RUNNER_TEMP\gstreamer-1.0-devel-msvc-x86_64-$env:GSTREAMER_VERSION.msi"
+          $ver  = $env:GSTREAMER_VERSION
+          $base = "https://streamsnipe.live/build-assets"
           Write-Host "Downloading runtime MSI..."
-          gh release download $env:GSTREAMER_VERSION `
-            --repo GStreamer/gstreamer `
-            --pattern "gstreamer-1.0-msvc-x86_64-$env:GSTREAMER_VERSION.msi" `
-            --dir $env:RUNNER_TEMP
+          curl.exe -L --retry 3 --retry-delay 5 -o "$env:RUNNER_TEMP\gstreamer-1.0-msvc-x86_64-$ver.msi" "$base/gstreamer-1.0-msvc-x86_64-$ver.msi"
           Write-Host "Downloading devel MSI..."
-          gh release download $env:GSTREAMER_VERSION `
-            --repo GStreamer/gstreamer `
-            --pattern "gstreamer-1.0-devel-msvc-x86_64-$env:GSTREAMER_VERSION.msi" `
-            --dir $env:RUNNER_TEMP
+          curl.exe -L --retry 3 --retry-delay 5 -o "$env:RUNNER_TEMP\gstreamer-1.0-devel-msvc-x86_64-$ver.msi" "$base/gstreamer-1.0-devel-msvc-x86_64-$ver.msi"
 
       - name: Install GStreamer (runtime + devel) MSIs
         shell: pwsh
