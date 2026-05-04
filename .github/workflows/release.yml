@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
 
 env:
-  GSTREAMER_VERSION: '1.24.10'
+  GSTREAMER_VERSION: '1.24.13'
   GSTREAMER_ROOT: 'C:\gstreamer\1.0\msvc_x86_64'
-  GSTREAMER_DEPS_TAG: 'build-deps-gstreamer-1.24.10'
+  GSTREAMER_DEPS_TAG: 'build-deps-gstreamer-1.24.13'
 
 jobs:
   build:
