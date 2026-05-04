@@ -52,7 +52,7 @@ jobs:
             $log = "$env:RUNNER_TEMP\$logName.log"
             Write-Host "==> Installing $path"
             $proc = Start-Process msiexec.exe `
-              -ArgumentList "/i", "`"$path`"", "/qn", "/norestart", "/l*v", "`"$log`"", "ADDLOCAL=ALL" `
+              -ArgumentList "/i", "`"$path`"", "/qn", "/norestart", "/l*v", "`"$log`"", "ADDLOCAL=ALL", "INSTALLDIR=C:\gstreamer" `
               -Wait -PassThru
             Write-Host "msiexec exit code: $($proc.ExitCode)"
             if ($proc.ExitCode -ne 0) {
@@ -73,12 +73,23 @@ jobs:
           Write-Host "==> Listing C:\gstreamer (post-install)"
           if (Test-Path C:\gstreamer) {
             Get-ChildItem -Path C:\gstreamer -Recurse -Depth 3 -Directory | Select-Object -ExpandProperty FullName
-          } else {
-            Write-Host "C:\gstreamer does not exist. Searching for gstreamer-1.0-0.dll system-wide..."
-            Get-ChildItem -Path C:\ -Filter "gstreamer-1.0-0.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 5 -ExpandProperty FullName
           }
 
           if (-not (Test-Path "$env:GSTREAMER_ROOT\bin\gstreamer-1.0-0.dll")) {
+            Write-Host "==> Expected DLL missing. Searching drives + user profile..."
+            $hits = Get-ChildItem -Path C:\, D:\, $env:USERPROFILE -Filter "gstreamer-1.0-0.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 5 -ExpandProperty FullName
+            if ($hits) {
+              Write-Host "Found gstreamer-1.0-0.dll at:"
+              $hits | ForEach-Object { Write-Host "  $_" }
+            } else {
+              Write-Host "Nothing found anywhere. Grepping MSI logs for INSTALLDIR/TARGETDIR..."
+              foreach ($l in @("$env:RUNNER_TEMP\gst-runtime-install.log", "$env:RUNNER_TEMP\gst-devel-install.log")) {
+                if (Test-Path $l) {
+                  Write-Host "----- $l (TARGETDIR/INSTALLDIR/Property lines) -----"
+                  Select-String -Path $l -Pattern 'INSTALLDIR|TARGETDIR|Installed external file' | Select-Object -First 30 | ForEach-Object { Write-Host $_.Line }
+                }
+              }
+            }
             Write-Error "GStreamer install missing: $env:GSTREAMER_ROOT not populated"
             exit 1
           }
