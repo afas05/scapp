@@ -62,7 +62,7 @@ export function useMediaSoup() {
         });
     }
 
-    async function startSharing() {
+    async function startSharing(windowHandle = null, processPid = null) {
         // 1a. Video PlainTransport (comedia=true; we just send RTP at it).
         const videoPt = await rpc.request(
             Method.CreateProducerPlainTransport,
@@ -150,6 +150,8 @@ export function useMediaSoup() {
             audioHost: audioPt.ip(),
             audioRtpPort: audioPt.port(),
             audioRtcpPort: audioPt.rtcpPort(),
+            windowHandle: windowHandle ?? null,
+            processPid: processPid ?? null,
         });
 
         pipelineRunning = true;

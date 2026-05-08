@@ -8,7 +8,9 @@ import { useUserStore } from "./stores/userStore";
 import { useMediaSoup } from "./composables/useMediaSoup.js";
 // @ts-ignore — JS module, no .d.ts
 import { loadConfig } from "./config.js";
+import WindowPicker from "./components/WindowPicker.vue";
 
+const showPicker = ref(false);
 const connectionState = ref(false);
 const connectProcess = ref(false);
 const producerId = ref('');
@@ -45,14 +47,18 @@ mediaSoup.on('streamEnded', () => {
   connectionState.value = false;
 });
 
-async function startStream() {
+function startStream() {
+  showPicker.value = true;
+}
+
+async function doStartStream({ windowHandle, processPid }: { windowHandle: number; processPid: number }) {
   errorMessage.value = '';
   connectProcess.value = true;
   try {
     const config = await loadConfig();
     console.log('[MediaSoup] Connecting to SFU:', config.sfuWsUrl);
     await mediaSoup.init(userStore.sessionHash, config);
-    await mediaSoup.startSharing();
+    await mediaSoup.startSharing(windowHandle, processPid);
   } catch (err: any) {
     console.error('[MediaSoup] Failed to start stream:', err);
     errorMessage.value = `Failed to start stream: ${err?.message ?? err}`;
@@ -131,6 +137,8 @@ onBeforeUnmount(() => {
       </button>
       <span v-if="updateStatus" class="update-status">{{ updateStatus }}</span>
     </div>
+
+    <WindowPicker v-model="showPicker" @selected="doStartStream" />
   </div>
 </template>
 

@@ -1,5 +1,17 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod gstreamer;
+#[cfg(windows)]
+mod windows_capture;
+
+#[tauri::command]
+async fn list_windows() -> Result<Vec<windows_capture::WindowInfo>, String> {
+    #[cfg(windows)]
+    return tauri::async_runtime::spawn_blocking(|| windows_capture::enumerate_windows())
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?;
+    #[cfg(not(windows))]
+    Err("Only supported on Windows".to_string())
+}
 
 #[tauri::command]
 async fn start_stream(
@@ -9,6 +21,8 @@ async fn start_stream(
     audio_host: String,
     audio_rtp_port: u16,
     audio_rtcp_port: u16,
+    window_handle: Option<u64>,
+    process_pid: Option<u32>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         gstreamer::start_streaming(
@@ -18,6 +32,8 @@ async fn start_stream(
             audio_host,
             audio_rtp_port,
             audio_rtcp_port,
+            window_handle,
+            process_pid,
         )
     })
     .await
@@ -63,7 +79,7 @@ pub fn run() {
             println!("[setup] GST_PLUGIN_PATH = {}", gst_plugin_path.display());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![start_stream, stop_stream])
+        .invoke_handler(tauri::generate_handler![start_stream, stop_stream, list_windows])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -174,6 +174,8 @@ pub fn create_gstreamer_pipeline(
     audio_host: &str,
     audio_rtp_port: u16,
     audio_rtcp_port: u16,
+    window_handle: Option<u64>,
+    process_pid: Option<u32>,
 ) -> Result<(), String> {
     // Initialize GStreamer if not already initialized
     if let Err(e) = init() {
@@ -197,27 +199,35 @@ pub fn create_gstreamer_pipeline(
         .build()
         .map_err(|_| "Failed to create rtpbin element".to_string())?;
 
-    // Create video elements - use fallback source if d3d12screencapturesrc fails
-    let src = match gst::ElementFactory::make("d3d12screencapturesrc")
-        .name("d3d12screencapturesrc")
-        .build()
-    {
-        Ok(element) => element,
-        Err(_) => {
-            println!("d3d12screencapturesrc not available, trying alternative sources...");
-            // Try dx9screencapsrc as fallback
-            match gst::ElementFactory::make("dx9screencapsrc")
-                .name("dx9screencapsrc")
-                .build()
-            {
-                Ok(element) => element,
-                Err(_) => {
-                    // Last resort: use videotestsrc for testing
-                    println!("Using videotestsrc as fallback");
-                    gst::ElementFactory::make("videotestsrc")
-                        .name("videotestsrc")
-                        .build()
-                        .map_err(|_| "Failed to create any video source element".to_string())?
+    // d3d12screencapturesrc has no window-handle property; only d3d11 does.
+    // Pick the source based on whether the user asked to capture a window.
+    let use_window_capture = window_handle.filter(|&h| h != 0).is_some();
+
+    let src = if use_window_capture {
+        gst::ElementFactory::make("d3d11screencapturesrc")
+            .name("d3d11screencapturesrc")
+            .build()
+            .map_err(|_| "d3d11screencapturesrc unavailable — required for window capture".to_string())?
+    } else {
+        match gst::ElementFactory::make("d3d12screencapturesrc")
+            .name("d3d12screencapturesrc")
+            .build()
+        {
+            Ok(element) => element,
+            Err(_) => {
+                println!("d3d12screencapturesrc not available, trying alternative sources...");
+                match gst::ElementFactory::make("dx9screencapsrc")
+                    .name("dx9screencapsrc")
+                    .build()
+                {
+                    Ok(element) => element,
+                    Err(_) => {
+                        println!("Using videotestsrc as fallback");
+                        gst::ElementFactory::make("videotestsrc")
+                            .name("videotestsrc")
+                            .build()
+                            .map_err(|_| "Failed to create any video source element".to_string())?
+                    }
                 }
             }
         }
@@ -354,6 +364,17 @@ pub fn create_gstreamer_pipeline(
     // existing screen-capture mirror: viewers hear what the streamer hears.
     audio_src.set_property("loopback", true);
     audio_src.set_property("low-latency", true);
+    if let Some(pid) = process_pid.filter(|&p| p != 0) {
+        // Per-process loopback needs BOTH loopback-mode=include-process-tree
+        // AND loopback-target-pid. Default loopback-mode captures the full
+        // system mix even when target-pid is set.
+        let mode_set = audio_src.find_property("loopback-mode").is_some();
+        let pid_set = audio_src.find_property("loopback-target-pid").is_some();
+        if mode_set && pid_set {
+            audio_src.set_property_from_str("loopback-mode", "include-process-tree");
+            audio_src.set_property("loopback-target-pid", pid);
+        }
+    }
 
     // 128 kbps stereo Opus tuned for general audio. frame-size=20 ms is the
     // common WebRTC default and matches what browser consumers expect.
@@ -474,12 +495,21 @@ pub fn create_gstreamer_pipeline(
     // Configure source based on type. Enum-typed properties on plugin
     // elements (e.g. videotestsrc.pattern) must be set via the nick string —
     // gstreamer-rs can't coerce a raw i32 to a plugin-defined GEnum.
-    if src.factory().unwrap().name() == "d3d12screencapturesrc" || src.factory().unwrap().name() == "dx9screencapsrc" {
-        src.set_properties(&[
-            ("show-cursor", &true),
-            ("monitor-index", &0i32),
-        ]);
-    } else if src.factory().unwrap().name() == "videotestsrc" {
+    let src_factory = src.factory().unwrap().name();
+    if src_factory == "d3d11screencapturesrc" {
+        src.set_property("show-cursor", &true);
+        if let Some(hwnd) = window_handle.filter(|&h| h != 0) {
+            // window-handle is honored only by the WGC backend; the default
+            // DXGI Desktop Duplication path ignores it and produces no frames.
+            src.set_property_from_str("capture-api", "wgc");
+            src.set_property("window-handle", hwnd);
+        } else {
+            src.set_property("monitor-index", &0i32);
+        }
+    } else if src_factory == "d3d12screencapturesrc" || src_factory == "dx9screencapsrc" {
+        src.set_property("show-cursor", &true);
+        src.set_property("monitor-index", &0i32);
+    } else if src_factory == "videotestsrc" {
         src.set_property_from_str("pattern", "smpte");
         src.set_property("is-live", true);
     }
@@ -572,15 +602,24 @@ pub fn create_gstreamer_pipeline(
         &opusenc, &rtpopuspay, &audio_rtp_sink, &audio_rtcp_sink, &audio_rtcp_src,
     ]).map_err(|_| "Failed to add elements to pipeline".to_string())?;
 
-    // d3d12screencapturesrc emits memory:D3D12Memory caps, which videoconvert can't accept.
-    // Require d3d12download in that path; other sources link directly to videoconvert.
-    if src.factory().unwrap().name() == "d3d12screencapturesrc" {
+    // d3d11/d3d12 screen-capture sources emit GPU-resident memory caps that
+    // videoconvert can't accept; insert the matching downloader to land the
+    // frames in system memory before the CPU pipeline picks them up.
+    let src_factory = src.factory().unwrap().name();
+    if src_factory == "d3d12screencapturesrc" {
         let d3d12download = gst::ElementFactory::make("d3d12download")
             .build()
             .map_err(|_| "d3d12screencapturesrc requires the d3d12download element, which is unavailable".to_string())?;
         pipeline.add(&d3d12download).map_err(|_| "Failed to add d3d12download to pipeline".to_string())?;
         gst::Element::link_many(&[&src, &d3d12download, &videoconvert, &videoscale, &capsfilter, &x264enc, &h264_capsfilter, &rtph264pay])
             .map_err(|e| format!("Failed to link video elements with d3d12download: {:?}", e))?;
+    } else if src_factory == "d3d11screencapturesrc" {
+        let d3d11download = gst::ElementFactory::make("d3d11download")
+            .build()
+            .map_err(|_| "d3d11screencapturesrc requires the d3d11download element, which is unavailable".to_string())?;
+        pipeline.add(&d3d11download).map_err(|_| "Failed to add d3d11download to pipeline".to_string())?;
+        gst::Element::link_many(&[&src, &d3d11download, &videoconvert, &videoscale, &capsfilter, &x264enc, &h264_capsfilter, &rtph264pay])
+            .map_err(|e| format!("Failed to link video elements with d3d11download: {:?}", e))?;
     } else {
         gst::Element::link_many(&[&src, &videoconvert, &videoscale, &capsfilter, &x264enc, &h264_capsfilter, &rtph264pay])
             .map_err(|e| format!("Failed to link video elements: {:?}", e))?;
@@ -861,6 +900,8 @@ pub fn start_streaming(
     audio_host: String,
     audio_rtp_port: u16,
     audio_rtcp_port: u16,
+    window_handle: Option<u64>,
+    process_pid: Option<u32>,
 ) -> Result<String, String> {
     init()?;
 
@@ -873,6 +914,7 @@ pub fn start_streaming(
     create_gstreamer_pipeline(
         &video_host, video_rtp_port, video_rtcp_port,
         &audio_host, audio_rtp_port, audio_rtcp_port,
+        window_handle, process_pid,
     )?;
 
     Ok("Streaming started successfully".to_string())
