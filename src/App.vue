@@ -22,7 +22,11 @@ onMounted(async () => {
 })
 
 async function onLogout() {
-  await userStore.logout()
+  try {
+    await userStore.logout()
+  } catch (err) {
+    console.error('[Logout] Failed to clear state:', err)
+  }
   await router.replace('/login')
 }
 

@@ -33,10 +33,14 @@ export const useUserStore = defineStore('user', {
             this.name = ''
             this.sessionHash = ''
             this.isLoggedIn = false
-            const store = await getStore()
-            await store.delete('name')
-            await store.delete('sessionHash')
-            await store.save()
+            try {
+                const store = await getStore()
+                await store.delete('name')
+                await store.delete('sessionHash')
+                await store.save()
+            } catch (err) {
+                console.error('[userStore] Failed to clear persisted auth:', err)
+            }
         },
         async hydrate() {
             try {

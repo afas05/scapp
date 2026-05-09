@@ -14,16 +14,17 @@
     "store:allow-get",
     "store:allow-set",
     "store:allow-save",
+    "store:allow-delete",
     "updater:default",
     "process:allow-restart",
     {
       "identifier": "http:default",
       "allow": [
         {
-          "url": "https://streamsnipe.live/api/login"
+          "url": "https://streamsnipe.live/api/*"
         },
         {
-          "url": "http://localhost/api/login"
+          "url": "http://localhost/api/*"
         }
       ],
       "deny": [
