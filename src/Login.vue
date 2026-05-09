@@ -29,7 +29,7 @@ async function loginAction() {
       return;
     }
 
-    useUserStore().login(data.user.name, data.access_token);
+    await useUserStore().login(data.user.name, data.access_token);
     await router.replace('/start')
   }).catch(err => {
     errorMessage.value = err.message;

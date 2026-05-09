@@ -38,7 +38,21 @@ mod win {
         GetDC, GetDIBits, ReleaseDC, SelectObject,
         BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
     };
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows::core::PWSTR;
+
+    // Process names that own cloaked / invisible system shells we want to hide.
+    const PROCESS_BLOCKLIST: &[&str] = &[
+        "TextInputHost.exe",          // Windows Input Experience
+        "ApplicationFrameHost.exe",   // hosts UWP frames; often cloaked
+        "SearchHost.exe",
+        "StartMenuExperienceHost.exe",
+        "ShellExperienceHost.exe",
+        "SystemSettings.exe",
+        "LockApp.exe",
+        "Widgets.exe",
+        "WidgetService.exe",
+    ];
 
     unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> windows::Win32::Foundation::BOOL {
         if is_capturable(hwnd) {
@@ -76,11 +90,34 @@ mod win {
             return false;
         }
 
+        // DWM-cloaked windows (e.g. TextInputHost / "Windows Input Experience")
+        // pass IsWindowVisible but are not actually drawn to the user.
+        let mut cloaked: u32 = 0;
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut _,
+            std::mem::size_of::<u32>() as u32,
+        )
+        .is_ok()
+            && cloaked != 0
+        {
+            return false;
+        }
+
         let mut class = [0u16; 256];
         let class_len = GetClassNameW(hwnd, &mut class);
         if class_len > 0 {
             let class_str = String::from_utf16_lossy(&class[..class_len as usize]);
-            if matches!(class_str.as_str(), "Shell_TrayWnd" | "Progman" | "WorkerW") {
+            if matches!(
+                class_str.as_str(),
+                "Shell_TrayWnd"
+                    | "Progman"
+                    | "WorkerW"
+                    | "Windows.UI.Core.CoreWindow"
+                    | "Xaml_WindowedPopupClass"
+                    | "Windows.Internal.Shell.TabProxyWindow"
+            ) {
                 return false;
             }
         }
@@ -268,13 +305,19 @@ mod win {
         // boundary as an isize handle and rebuild HWND inside the worker.
         let infos: Vec<(isize, String, u32, String)> = hwnds
             .iter()
-            .map(|&hwnd| {
+            .filter_map(|&hwnd| {
                 let (title, pid, proc_name) = unsafe {
                     let t = get_window_title(hwnd);
                     let (p, n) = get_process_info(hwnd);
                     (t, p, n)
                 };
-                (hwnd.0 as isize, title, pid, proc_name)
+                if PROCESS_BLOCKLIST
+                    .iter()
+                    .any(|blocked| proc_name.eq_ignore_ascii_case(blocked))
+                {
+                    return None;
+                }
+                Some((hwnd.0 as isize, title, pid, proc_name))
             })
             .collect();
 

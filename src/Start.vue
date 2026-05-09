@@ -1,8 +1,6 @@
 <script setup lang="ts">
 import { ref, onBeforeUnmount } from "vue";
 import { open } from '@tauri-apps/plugin-shell';
-import { check } from '@tauri-apps/plugin-updater';
-import { relaunch } from '@tauri-apps/plugin-process';
 import { useUserStore } from "./stores/userStore";
 // @ts-ignore — JS composable, no .d.ts
 import { useMediaSoup } from "./composables/useMediaSoup.js";
@@ -17,8 +15,6 @@ const producerId = ref('');
 const userSession = ref('');
 const viewerCount = ref(0);
 const errorMessage = ref('');
-const updateStatus = ref('');
-const updateBusy = ref(false);
 
 const userStore = useUserStore();
 const mediaSoup = useMediaSoup();
@@ -83,28 +79,6 @@ function openStream() {
   open('https://streamsnipe.live?streamId=' + producerId.value);
 }
 
-async function checkForUpdate() {
-  if (updateBusy.value) return;
-  updateBusy.value = true;
-  updateStatus.value = 'Checking for updates...';
-  try {
-    const update = await check();
-    if (!update) {
-      updateStatus.value = 'You are on the latest version.';
-      return;
-    }
-    updateStatus.value = `Downloading ${update.version}...`;
-    await update.downloadAndInstall();
-    updateStatus.value = 'Installed. Restarting...';
-    await relaunch();
-  } catch (err: any) {
-    console.error('[Updater] Failed:', err);
-    updateStatus.value = `Update failed: ${err?.message ?? err}`;
-  } finally {
-    updateBusy.value = false;
-  }
-}
-
 onBeforeUnmount(() => {
   if (connectionState.value || connectProcess.value) {
     mediaSoup.destroy().catch(() => {});
@@ -131,13 +105,6 @@ onBeforeUnmount(() => {
       <br />
       <a @click.prevent="openStream" :href="'https://streamsnipe.live?streamId=' + producerId">Open stream</a>
     </div>
-    <div class="update-row">
-      <button class="update-button" @click="checkForUpdate" :disabled="updateBusy">
-        Check for updates
-      </button>
-      <span v-if="updateStatus" class="update-status">{{ updateStatus }}</span>
-    </div>
-
     <WindowPicker v-model="showPicker" @selected="doStartStream" />
   </div>
 </template>
@@ -174,32 +141,5 @@ onBeforeUnmount(() => {
 #stop-stream:hover {
   background-color: #7a0e01;
   border: 1px solid #7a0e01;
-}
-.update-row {
-  margin-top: 1.5rem;
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-.update-button {
-  border-radius: 9999px;
-  background-color: transparent;
-  border: 1px solid #888;
-  color: #ccc;
-  font-size: 0.85rem;
-  padding: 0.4rem 1rem;
-  cursor: pointer;
-}
-.update-button:hover:not(:disabled) {
-  border-color: #ccc;
-  color: white;
-}
-.update-button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-.update-status {
-  color: #ccc;
-  font-size: 0.85rem;
 }
 </style>

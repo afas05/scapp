@@ -1,6 +1,6 @@
 [package]
 name = "scapp"
-version = "0.3.6"
+version = "0.3.7"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -43,5 +43,6 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_Storage_Xps",
 ] }
