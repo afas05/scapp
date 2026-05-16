@@ -43,6 +43,11 @@ function select(win: WindowInfo) {
   emit('selected', { windowHandle: win.id, processPid: win.pid });
   close();
 }
+
+function selectScreen() {
+  emit('selected', { windowHandle: 0, processPid: 0 });
+  close();
+}
 </script>
 
 <template>
@@ -63,11 +68,25 @@ function select(win: WindowInfo) {
           {{ error }}
         </div>
 
-        <div v-else-if="windows.length === 0" class="picker-status">
-          No capturable windows found.
-        </div>
-
         <div v-else class="picker-grid">
+          <div
+            class="window-card"
+            :class="{ hovered: hoveredId === 0 }"
+            @mouseenter="hoveredId = 0"
+            @mouseleave="hoveredId = null"
+          >
+            <div class="thumbnail-wrapper">
+              <div class="thumbnail-placeholder screen-tile">
+                <span class="screen-icon">🖥</span>
+                <span>Entire Screen</span>
+              </div>
+              <div v-show="hoveredId === 0" class="hover-overlay">
+                <button class="select-btn" @click="selectScreen">Select</button>
+              </div>
+            </div>
+            <p class="window-title">Entire Screen</p>
+            <p class="window-process">Primary monitor</p>
+          </div>
           <div
             v-for="win in windows"
             :key="win.id"
@@ -217,6 +236,19 @@ function select(win: WindowInfo) {
   justify-content: center;
   color: #444;
   font-size: 0.8rem;
+}
+
+.screen-tile {
+  flex-direction: column;
+  gap: 0.5rem;
+  background: linear-gradient(135deg, #2a1a4e 0%, #4c036c 100%);
+  color: #fff;
+  font-size: 0.95rem;
+}
+
+.screen-icon {
+  font-size: 2.5rem;
+  line-height: 1;
 }
 
 .hover-overlay {
