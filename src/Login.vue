@@ -50,7 +50,9 @@ async function loginAction() {
         <div>
           <input class="app-input" v-model="password" placeholder="Password" type="password"/>
         </div>
-        <button type="submit">Login</button>
+        <div class="submit-row">
+          <button type="submit">Login</button>
+        </div>
       </form>
     </div>
     <p>{{ errorMessage }}</p>
@@ -58,10 +60,38 @@ async function loginAction() {
 </template>
 
 <style scoped>
+.row {
+  display: flex;
+  justify-content: center;
+}
 #login-logo {
   height: 100px;
 }
 .logo-row {
+  margin-top: 8vh;
   margin-bottom: 1rem;
+}
+.submit-row {
+  display: flex;
+  justify-content: center;
+}
+button[type='submit'] {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 20px;
+  border-radius: 6px;
+  background: linear-gradient(180deg, var(--accent) 0%, var(--accent-soft) 100%);
+  color: #fff;
+  border: 1px solid var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  margin-top: 6px;
+  box-shadow: 0 4px 20px var(--accent-glow);
+}
+p {
+  text-align: center;
+  color: #ff6b6b;
+  font-size: 12px;
 }
 </style>

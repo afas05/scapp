@@ -1,0 +1,86 @@
+:root {
+  --bg:           oklch(0.16 0.012 290);
+  --bg-deep:      oklch(0.12 0.01 290);
+  --surface-1:    oklch(0.21 0.014 290);
+  --surface-2:    oklch(0.26 0.016 290);
+  --surface-3:    oklch(0.30 0.018 290);
+  --border:       oklch(0.32 0.013 290);
+  --border-soft:  oklch(0.26 0.011 290);
+  --text:         oklch(0.97 0.005 290);
+  --text-dim:     oklch(0.72 0.012 290);
+  --text-mute:    oklch(0.54 0.013 290);
+  --accent:       oklch(0.66 0.20 305);
+  --accent-soft:  oklch(0.42 0.16 305);
+  --accent-glow:  oklch(0.66 0.20 305 / 0.32);
+  --live:         oklch(0.80 0.16 158);
+  --live-soft:    oklch(0.38 0.13 158);
+  --rec:          oklch(0.68 0.22 22);
+  --rec-soft:     oklch(0.32 0.13 22);
+  --warn:         oklch(0.80 0.15 80);
+
+  font-family: 'Geist', sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text);
+  background-color: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.ws-mono {
+  font-family: 'Geist Mono', monospace;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+@keyframes wsPulse {
+  0%   { transform: scale(0.8); opacity: 0.5; }
+  100% { transform: scale(2.2); opacity: 0; }
+}
+
+@keyframes wsSpin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes wsBlink {
+  50% { opacity: 0.35; }
+}
+
+button:focus-visible,
+.ws-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.ws-link {
+  color: var(--accent);
+  text-decoration: none;
+  cursor: pointer;
+}
+.ws-link:hover { text-decoration: underline; }
+
+.ws-scroll::-webkit-scrollbar { height: 6px; width: 6px; }
+.ws-scroll::-webkit-scrollbar-track { background: transparent; }
+.ws-scroll::-webkit-scrollbar-thumb {
+  background: var(--surface-3);
+  border-radius: 999px;
+}
