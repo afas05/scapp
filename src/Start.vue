@@ -24,6 +24,12 @@ interface WindowInfo {
   thumbnail: string;
 }
 
+interface MicDevice {
+  id: string;
+  name: string;
+  isDefault: boolean;
+}
+
 const router = useRouter();
 const userStore = useUserStore();
 const mediaSoup = useMediaSoup();
@@ -35,7 +41,8 @@ const sources = ref<IdleSource[]>([]);
 const selectedId = ref<number>(0);
 const cameraOn = ref<boolean>(true);
 const micOn = ref<boolean>(true);
-const micDevice = ref<string>('HyperX QuadCast');
+const availableMics = ref<MicDevice[]>([]);
+const micDevice = ref<string>('');
 const camDevice = ref<string>('Logitech C920');
 
 const producerId = ref<string>('');
@@ -62,6 +69,21 @@ function kindFromProcess(name: string): IdleSource['kind'] {
   if (n.includes('chrome') || n.includes('firefox') || n.includes('edge') || n.includes('discord')) return 'browser';
   if (n.includes('code') || n.includes('rider') || n.includes('idea') || n.includes('explorer')) return 'app';
   return 'game';
+}
+
+async function loadMicDevices() {
+  try {
+    const list = await invoke<MicDevice[]>('list_audio_inputs');
+    availableMics.value = list;
+    if (!micDevice.value || !list.some(m => m.id === micDevice.value)) {
+      const def = list.find(m => m.isDefault) ?? list[0];
+      micDevice.value = def?.id ?? '';
+    }
+  } catch (e: any) {
+    console.warn('[Mics] list_audio_inputs failed:', e);
+    availableMics.value = [];
+    micDevice.value = '';
+  }
 }
 
 async function loadSources() {
@@ -140,12 +162,26 @@ async function startStream() {
     const config = await loadConfig();
     console.log('[MediaSoup] Connecting to SFU:', config.sfuWsUrl);
     await mediaSoup.init(userStore.sessionHash, config);
-    await mediaSoup.startSharing(selectedSource.value.id, selectedSource.value.pid);
+    await mediaSoup.startSharing(
+      selectedSource.value.id,
+      selectedSource.value.pid,
+      micOn.value,
+      micDevice.value || null,
+    );
   } catch (err: any) {
     console.error('[MediaSoup] Failed to start stream:', err);
     errorMessage.value = `Failed to start stream: ${err?.message ?? err}`;
     phase.value = 'idle';
     try { await mediaSoup.destroy(); } catch {}
+  }
+}
+
+async function onLiveToggleMic() {
+  micOn.value = !micOn.value;
+  try {
+    await invoke('set_mic_muted', { muted: !micOn.value });
+  } catch (err) {
+    console.warn('[Mic] set_mic_muted failed:', err);
   }
 }
 
@@ -208,6 +244,7 @@ async function checkForUpdate() {
 
 onMounted(() => {
   loadSources();
+  loadMicDevices();
 });
 
 onBeforeUnmount(() => {
@@ -228,6 +265,7 @@ onBeforeUnmount(() => {
       :camera-on="cameraOn"
       :mic-on="micOn"
       :mic-device="micDevice"
+      :available-mics="availableMics"
       :cam-device="camDevice"
       :last-session="lastSession"
       :update-status="updateStatus"
@@ -248,11 +286,13 @@ onBeforeUnmount(() => {
       :selected-id="selectedId"
       :camera-on="cameraOn"
       :mic-on="micOn"
+      :mic-device="micDevice"
+      :available-mics="availableMics"
       :viewer-count="viewerCount"
       :share-url="shareUrl"
       @select="id => (selectedId = id)"
       @toggle-camera="cameraOn = !cameraOn"
-      @toggle-mic="micOn = !micOn"
+      @toggle-mic="onLiveToggleMic"
       @stop="stopStream"
     />
 

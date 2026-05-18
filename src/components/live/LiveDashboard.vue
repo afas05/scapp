@@ -10,17 +10,21 @@ import SourceCard from '../idle/SourceCard.vue';
 import Stat from './Stat.vue';
 import NetworkBars from './NetworkBars.vue';
 import MixerRow from './MixerRow.vue';
-import { useMicLevel, fmtDuration } from '../../composables/useMicLevel';
-import type { IdleSource } from '../idle/IdleHome.vue';
+import { useMicLevel, useSimulatedLevel, fmtDuration } from '../../composables/useMicLevel';
+import type { IdleSource, MicDevice } from '../idle/IdleHome.vue';
 
 const props = withDefaults(defineProps<{
   sources: IdleSource[];
   selectedId: number;
   cameraOn: boolean;
   micOn: boolean;
+  micDevice?: string;
+  availableMics?: MicDevice[];
   viewerCount?: number;
   shareUrl?: string;
 }>(), {
+  micDevice: '',
+  availableMics: () => [],
   viewerCount: 0,
   shareUrl: 'streamsnipe.live',
 });
@@ -77,8 +81,11 @@ const fps = computed(() =>
   60 - Math.max(0, Math.round(Math.sin(tick.value * 0.2) * 0.5))
 );
 
-const mic = useMicLevel(() => props.micOn, 0.48);
-const game = useMicLevel(() => true, 0.62);
+const selectedMicName = computed(() =>
+  props.availableMics.find(m => m.id === props.micDevice)?.name
+);
+const { level: mic } = useMicLevel(() => props.micOn, () => selectedMicName.value);
+const game = useSimulatedLevel(() => true, 0.62);
 
 const recording = ref(false);
 const recStart = ref<number | null>(null);

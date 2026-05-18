@@ -14,6 +14,13 @@ async fn list_windows() -> Result<Vec<windows_capture::WindowInfo>, String> {
 }
 
 #[tauri::command]
+async fn list_audio_inputs() -> Result<Vec<gstreamer::MicDevice>, String> {
+    tauri::async_runtime::spawn_blocking(|| gstreamer::list_audio_input_devices())
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+}
+
+#[tauri::command]
 async fn start_stream(
     video_host: String,
     video_rtp_port: u16,
@@ -23,6 +30,9 @@ async fn start_stream(
     audio_rtcp_port: u16,
     window_handle: Option<u64>,
     process_pid: Option<u32>,
+    mic_enabled: Option<bool>,
+    mic_device_id: Option<String>,
+    mic_initially_muted: Option<bool>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         gstreamer::start_streaming(
@@ -34,6 +44,9 @@ async fn start_stream(
             audio_rtcp_port,
             window_handle,
             process_pid,
+            mic_enabled.unwrap_or(false),
+            mic_device_id,
+            mic_initially_muted.unwrap_or(false),
         )
     })
     .await
@@ -47,6 +60,13 @@ async fn stop_stream() -> Result<(), String> {
     })
     .await
     .map_err(|e| format!("Failed to join task: {}", e))?
+}
+
+#[tauri::command]
+async fn set_mic_muted(muted: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gstreamer::set_mic_muted(muted))
+        .await
+        .map_err(|e| format!("Failed to join task: {}", e))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -79,7 +99,7 @@ pub fn run() {
             println!("[setup] GST_PLUGIN_PATH = {}", gst_plugin_path.display());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![start_stream, stop_stream, list_windows])
+        .invoke_handler(tauri::generate_handler![start_stream, stop_stream, list_windows, list_audio_inputs, set_mic_muted])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

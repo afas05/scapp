@@ -10,13 +10,6 @@ import SourceCard from './SourceCard.vue';
 import DeviceSelect from './DeviceSelect.vue';
 import { useMicLevel } from '../../composables/useMicLevel';
 
-const MIC_DEVICES = [
-  'HyperX QuadCast',
-  'Realtek Audio (Built-in)',
-  'AirPods Pro Max',
-  'NVIDIA Broadcast',
-];
-
 const CAM_DEVICES = [
   'Logitech C920',
   'Integrated Webcam',
@@ -33,6 +26,12 @@ export interface IdleSource {
   kind?: 'game' | 'browser' | 'app' | 'desktop';
 }
 
+export interface MicDevice {
+  id: string;
+  name: string;
+  isDefault: boolean;
+}
+
 const props = withDefaults(defineProps<{
   appVersion?: string;
   sfuLatencyMs?: number;
@@ -41,13 +40,15 @@ const props = withDefaults(defineProps<{
   cameraOn: boolean;
   micOn: boolean;
   micDevice?: string;
+  availableMics?: MicDevice[];
   camDevice?: string;
   lastSession?: { duration: string; peakViewers: number } | null;
   updateStatus?: string;
 }>(), {
   appVersion: 'v0.3.9',
   sfuLatencyMs: 28,
-  micDevice: 'HyperX QuadCast',
+  micDevice: '',
+  availableMics: () => [],
   camDevice: 'Logitech C920',
   lastSession: null,
   updateStatus: '',
@@ -65,7 +66,14 @@ const emit = defineEmits<{
   checkUpdate: [];
 }>();
 
-const micLevel = useMicLevel(() => props.micOn, 0.42);
+const selectedMic = computed(() =>
+  props.availableMics.find(m => m.id === props.micDevice)
+);
+
+const { level: micLevel, dbfs } = useMicLevel(
+  () => props.micOn,
+  () => selectedMic.value?.name,
+);
 
 const selectedSource = computed(() =>
   props.sources.find(s => s.id === props.selectedId) || props.sources[0]
@@ -73,8 +81,19 @@ const selectedSource = computed(() =>
 
 const dbLabel = computed(() => {
   if (!props.micOn) return '—';
-  return `-${Math.round(20 - micLevel.value * 20)}dB`;
+  if (!Number.isFinite(dbfs.value)) return '-∞dB';
+  const v = Math.max(-60, Math.min(0, dbfs.value));
+  return `${Math.round(v)}dB`;
 });
+
+const micOptions = computed(() => props.availableMics.map(m => m.name));
+const micDisplayName = computed(() =>
+  selectedMic.value?.name ?? (props.availableMics[0]?.name ?? '')
+);
+function onPickMicName(name: string) {
+  const found = props.availableMics.find(m => m.name === name);
+  if (found) emit('pickMic', found.id);
+}
 
 // up to 4 cards, plus a "more" tile
 const quickSources = computed(() => props.sources.slice(0, 4));
@@ -137,10 +156,10 @@ const quickSources = computed(() => props.sources.slice(0, 4));
           >
             <template #value>
               <DeviceSelect
-                :value="micDevice"
-                :options="MIC_DEVICES"
-                :disabled="!micOn"
-                @change="v => emit('pickMic', v)"
+                :value="micDisplayName"
+                :options="micOptions"
+                :disabled="!micOn || micOptions.length === 0"
+                @change="onPickMicName"
               />
             </template>
             <div class="meter-row">
@@ -158,7 +177,7 @@ const quickSources = computed(() => props.sources.slice(0, 4));
           >
             <template #value>
               <DeviceSelect
-                :value="camDevice"
+                :value="camDevice ?? ''"
                 :options="CAM_DEVICES"
                 :disabled="!cameraOn"
                 @change="v => emit('pickCam', v)"

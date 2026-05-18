@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use glib::ObjectExt;
 use glib::Cast;
-use gstreamer::prelude::{ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual, GstObjectExt, PadExt, PadExtManual};
+use gstreamer::prelude::{DeviceExt, DeviceMonitorExt, DeviceMonitorExtManual, ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual, GstObjectExt, PadExt, PadExtManual};
 
 // Diagnostic counters incremented by pad probes; the stats thread reads and
 // resets them once per second to compute per-stage rates.
@@ -39,6 +39,144 @@ const LOCAL_VIDEO_RTCP_PORT: i32 = 5003;
 const LOCAL_AUDIO_RTCP_PORT: i32 = 5005;
 const VIDEO_SSRC: u32 = 2222;
 const AUDIO_SSRC: u32 = 1111;
+
+#[derive(serde::Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MicDevice {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+// Snapshot the GstDevice list and extract a stable wasapi endpoint id for
+// each — used both for the frontend listing (`MicDevice.id`) and to look the
+// device back up at start_streaming time so wasapi2src is built via
+// `Device::create_element`, which configures every internal endpoint property
+// the plugin needs (not just the `device` GObject property).
+fn enumerate_audio_input_devices() -> Vec<(gst::Device, String, String, bool)> {
+    let monitor = gst::DeviceMonitor::new();
+    let caps = gst::Caps::new_empty_simple("audio/x-raw");
+    let _ = monitor.add_filter(Some("Audio/Source"), Some(&caps));
+    if monitor.start().is_err() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<(gst::Device, String, String, bool)> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for device in monitor.devices() {
+        let name = device.display_name().to_string();
+        let props = device.properties();
+
+        // The DeviceMonitor exposes Audio/Source devices from EVERY registered
+        // provider (wasapi2, directsound, dshow, ksvideosrc, …). Each provider
+        // stamps device IDs in its own format that only its matching `*src`
+        // element understands. If we accept a non-wasapi2 device into the
+        // returned list, our `Device::create_element` call at start_streaming
+        // time builds a non-wasapi2 source element (e.g. `directsoundsrc`)
+        // and the rest of the wasapi2-only mic chain falls apart — or worse,
+        // the fallback path constructs `wasapi2src device=<dshow-id>` which
+        // silently fails endpoint lookup and opens the default device
+        // instead. Strict wasapi2-only enumeration prevents both modes.
+        let api_ok = props
+            .as_ref()
+            .and_then(|p| p.get::<String>("device.api").ok())
+            .as_deref()
+            .map(|v| v == "wasapi2")
+            .unwrap_or(false);
+        if !api_ok {
+            continue;
+        }
+
+        // The wasapi2 device provider exposes EVERY render endpoint a second
+        // time as an Audio/Source "loopback proxy" — the device appears with
+        // the speaker/headphone's display name (e.g. "Speakers (HyperX …)")
+        // and `Device::create_element` builds a `wasapi2src` with
+        // `loopback=true` wired in. Picking such an entry as a mic actually
+        // captures whatever is playing through those speakers, not the user's
+        // microphone. Build a throwaway element via the device provider and
+        // inspect its `loopback` property — if it's true, skip the entry
+        // outright. We reuse the same temp element to pull the canonical
+        // `device` string when the property-bag path didn't expose it.
+        let temp_el = device.create_element(None).ok();
+        let is_loopback = temp_el
+            .as_ref()
+            .filter(|el| el.find_property("loopback").is_some())
+            .map(|el| el.property::<bool>("loopback"))
+            .unwrap_or(false);
+        if is_loopback {
+            continue;
+        }
+
+        // Try every plausible field where the wasapi2 provider stamps its
+        // endpoint id. The temp-element fallback is last because some builds
+        // return an element with no `device` set — the canonical answer is
+        // in `properties`.
+        let id: Option<String> = props
+            .as_ref()
+            .and_then(|p| {
+                p.get::<String>("device.strid")
+                    .or_else(|_| p.get::<String>("device.id"))
+                    .or_else(|_| p.get::<String>("wasapi2.device.id"))
+                    .ok()
+            })
+            .or_else(|| {
+                temp_el.as_ref().and_then(|el| {
+                    if el.find_property("device").is_some() {
+                        el.property::<Option<String>>("device")
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        let id = match id {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+
+        if !seen_ids.insert(id.clone()) {
+            continue;
+        }
+
+        let is_default = props
+            .as_ref()
+            .and_then(|p| p.get::<bool>("is-default").ok())
+            .unwrap_or(false);
+
+        out.push((device, id, name, is_default));
+    }
+
+    monitor.stop();
+
+    if !out.is_empty() && !out.iter().any(|(_, _, _, def)| *def) {
+        out[0].3 = true;
+    }
+
+    out
+}
+
+pub fn list_audio_input_devices() -> Result<Vec<MicDevice>, String> {
+    init()?;
+    Ok(enumerate_audio_input_devices()
+        .into_iter()
+        .map(|(_, id, name, is_default)| MicDevice { id, name, is_default })
+        .collect())
+}
+
+// Toggle the mic branch's `valve.drop` property on the running pipeline.
+// Returns Ok(()) with no effect if there's no pipeline or no mic branch.
+pub fn set_mic_muted(muted: bool) -> Result<(), String> {
+    let state = STATE.lock().unwrap();
+    let pipeline = match &state.pipeline {
+        Some(p) => p.clone(),
+        None => return Ok(()),
+    };
+    if let Some(valve) = pipeline.by_name("mic_valve") {
+        valve.set_property("drop", muted);
+    }
+    Ok(())
+}
 
 // Global state structure
 struct GstreamerState {
@@ -166,7 +304,9 @@ fn find_pipeline(start: &gst::Object) -> Option<gst::Pipeline> {
 // pads, set the audio elements to NULL, and remove them entirely.
 fn disable_audio_chain(pipeline: &gst::Pipeline) -> bool {
     let names = [
-        "wasapi2src", "audioconvert", "audioresample",
+        "wasapi2src", "audioconvert", "audioresample", "sys_audio_caps",
+        "mic_src", "mic_audioconvert", "mic_audioresample", "mic_caps", "mic_valve",
+        "audio_mixer",
         "opus_capsfilter", "opusenc", "rtpopuspay",
         "audio_rtp_sink", "audio_rtcp_sink", "audio_rtcp_src",
     ];
@@ -221,6 +361,33 @@ fn disable_audio_chain(pipeline: &gst::Pipeline) -> bool {
     true
 }
 
+// Pop any queued error messages from the pipeline bus. Used when a synchronous
+// state-change call fails so the surfaced Tauri error includes the actual
+// upstream cause (which element / what went wrong) instead of the generic
+// `StateChangeError`. Drains for up to a short timeout each pop.
+fn drain_bus_errors(pipeline: &gst::Pipeline) -> String {
+    let bus = match pipeline.bus() {
+        Some(b) => b,
+        None => return String::new(),
+    };
+    let mut out = String::new();
+    while let Some(msg) = bus.timed_pop_filtered(
+        Some(gst::ClockTime::from_mseconds(100)),
+        &[gst::MessageType::Error, gst::MessageType::Warning],
+    ) {
+        if let gst::MessageView::Error(err) = msg.view() {
+            out.push_str(&format!(
+                " — {} from {:?}: {}  debug={:?}",
+                if msg.type_() == gst::MessageType::Error { "error" } else { "warning" },
+                err.src().map(|s| s.path_string().to_string()),
+                err.error(),
+                err.debug(),
+            ));
+        }
+    }
+    out
+}
+
 fn bus_call(_bus: &gst::Bus, msg: &gst::Message) -> glib::ControlFlow {
     match msg.view() {
         gst::MessageView::Eos(..) => {
@@ -243,7 +410,7 @@ fn bus_call(_bus: &gst::Bus, msg: &gst::Message) -> glib::ControlFlow {
             // ERROR, blocking data flow upstream through rtpbin.
             let from_audio = err.src()
                 .map(|s| s.path_string().to_string())
-                .map(|p| p.contains("wasapi2src"))
+                .map(|p| p.contains("wasapi2src") || p.contains("mic_src"))
                 .unwrap_or(false);
             if from_audio {
                 if let Some(src) = err.src() {
@@ -315,6 +482,9 @@ pub fn create_gstreamer_pipeline(
     audio_rtcp_port: u16,
     window_handle: Option<u64>,
     process_pid: Option<u32>,
+    mic_enabled: bool,
+    mic_device_id: Option<String>,
+    mic_initially_muted: bool,
 ) -> Result<(), String> {
     // Initialize GStreamer if not already initialized
     if let Err(e) = init() {
@@ -528,6 +698,123 @@ pub fn create_gstreamer_pipeline(
         .field("channels", 2i32)
         .build();
     opus_capsfilter.set_property("caps", &opus_in_caps);
+
+    // audiomixer enforces a single negotiated format across all its sinks, so
+    // we pin format=F32LE (wasapi2src's native output) on both branches'
+    // upstream capsfilters. Without an explicit format the two chains can
+    // pick S16LE vs F32LE independently and the mixer refuses to link.
+    //
+    // `channel-mask` is REQUIRED for >1 channel streams — audioconvert's
+    // mono → stereo upmix without an explicit channel-mask falls back to a
+    // 0x0 ("no positions specified") layout and silently produces zero
+    // samples on both channels. Pinning the canonical FL+FR mask (0x3) makes
+    // the upmix actually duplicate the mic's mono signal across L+R.
+    let mixer_in_caps = gst::Caps::builder("audio/x-raw")
+        .field("format", "F32LE")
+        .field("layout", "interleaved")
+        .field("rate", 48000i32)
+        .field("channels", 2i32)
+        .field("channel-mask", gst::Bitmask::new(0x3))
+        .build();
+
+    // Mic branch wiring: only built when the frontend provided a device id.
+    // System audio goes to mixer sink_0; mic goes through a valve (for live
+    // mute) into sink_1. When no mic device is supplied, the original
+    // single-source audio chain is used unchanged.
+    let mic_branch = if let Some(ref dev_id) = mic_device_id {
+        // Re-enumerate at start time and look up the same device by stable id.
+        // `Device::create_element` builds a wasapi2src that's already wired to
+        // the right endpoint via internal device fields — setting only the
+        // `device` GObject property on a freshly-constructed wasapi2src isn't
+        // enough on some builds (the plugin opens the wrong endpoint or none).
+        let devices = enumerate_audio_input_devices();
+        let device_match = devices.into_iter().find(|(_, id, _, _)| id == dev_id);
+        let mic_src = match device_match {
+            Some((dev, _, _, _)) => dev
+                .create_element(Some("mic_src"))
+                .map_err(|e| format!("Failed to create mic element from device: {:?}", e))?,
+            None => {
+                let el = gst::ElementFactory::make("wasapi2src")
+                    .name("mic_src")
+                    .build()
+                    .map_err(|_| "Failed to create wasapi2src for mic input".to_string())?;
+                el.set_property("device", dev_id.as_str());
+                el
+            }
+        };
+        // Do NOT enable `low-latency` on the mic capture endpoint — it sets
+        // AUDCLNT_STREAMFLAGS_EVENTCALLBACK and asks for the device's minimum
+        // native period; many capture endpoints (USB mics, built-in arrays,
+        // anything with driver-side processing) reject that in shared mode
+        // and IAudioClient::Initialize fails with AUDCLNT_E_UNSUPPORTED_FORMAT
+        // — surfaced by the plugin as a bare "Failed to open device". The
+        // system-audio loopback branch uses a different WASAPI code path and
+        // tolerates low-latency, which is why copy-pasting that setting here
+        // was wrong.
+        let mic_audioconvert = gst::ElementFactory::make("audioconvert")
+            .name("mic_audioconvert")
+            .build()
+            .map_err(|_| "Failed to create mic audioconvert".to_string())?;
+        let mic_audioresample = gst::ElementFactory::make("audioresample")
+            .name("mic_audioresample")
+            .build()
+            .map_err(|_| "Failed to create mic audioresample".to_string())?;
+        let mic_caps = gst::ElementFactory::make("capsfilter")
+            .name("mic_caps")
+            .build()
+            .map_err(|_| "Failed to create mic capsfilter".to_string())?;
+        mic_caps.set_property("caps", &mixer_in_caps);
+        let mic_valve = gst::ElementFactory::make("valve")
+            .name("mic_valve")
+            .build()
+            .map_err(|_| "Failed to create mic valve element".to_string())?;
+        // drop=true → discards buffers immediately (mute). The mic branch is
+        // always wired into the mixer; the valve gates flow at runtime.
+        mic_valve.set_property("drop", mic_initially_muted || !mic_enabled);
+        Some((mic_src, mic_audioconvert, mic_audioresample, mic_caps, mic_valve))
+    } else {
+        None
+    };
+
+    let sys_audio_caps = gst::ElementFactory::make("capsfilter")
+        .name("sys_audio_caps")
+        .build()
+        .map_err(|_| "Failed to create sys_audio_caps capsfilter".to_string())?;
+    // When mixing we need a fully-specified format; without a mixer the
+    // existing opus_capsfilter downstream is sufficient and we keep the lighter
+    // rate/channels-only caps so audioconvert/audioresample can pick a format
+    // that opusenc happily ingests.
+    if mic_device_id.is_some() {
+        sys_audio_caps.set_property("caps", &mixer_in_caps);
+    } else {
+        sys_audio_caps.set_property("caps", &opus_in_caps);
+    }
+
+    let audio_mixer = if mic_branch.is_some() {
+        let mixer = gst::ElementFactory::make("audiomixer")
+            .name("audio_mixer")
+            .build()
+            .map_err(|_| "Failed to create audiomixer element".to_string())?;
+        // Be lenient about live-source alignment. wasapi2src for a fresh
+        // capture endpoint can hand its first buffers up with timestamps that
+        // are several tens of ms behind the already-running loopback source;
+        // audiomixer's default alignment-threshold (40 ms) classifies those
+        // as "too late" and silently drops them, so the viewer hears the
+        // game/system audio but never the mic. Widening the window keeps both
+        // streams mixed instead of dropped.
+        if mixer.find_property("alignment-threshold").is_some() {
+            // 200 ms (in nanoseconds)
+            mixer.set_property("alignment-threshold", 200_000_000u64);
+        }
+        if mixer.find_property("latency").is_some() {
+            // Mixer holds output for `latency` ns to allow late inputs to
+            // arrive — same reason as above, just on the output side.
+            mixer.set_property("latency", 100_000_000u64);
+        }
+        Some(mixer)
+    } else {
+        None
+    };
 
     // Loopback capture of the default render endpoint (system mix). The
     // existing screen-capture mirror: viewers hear what the streamer hears.
@@ -772,9 +1059,17 @@ pub fn create_gstreamer_pipeline(
         &rtpbin, &src,
         &videoenc, &h264_capsfilter, &rtph264pay, &rtp_sink,
         &rtcp_sink, &rtcp_src,
-        &audio_src, &audioconvert, &audioresample, &opus_capsfilter,
+        &audio_src, &audioconvert, &audioresample, &sys_audio_caps, &opus_capsfilter,
         &opusenc, &rtpopuspay, &audio_rtp_sink, &audio_rtcp_sink, &audio_rtcp_src,
     ]).map_err(|_| "Failed to add elements to pipeline".to_string())?;
+
+    if let Some((ref mic_src, ref mic_ac, ref mic_ar, ref mic_caps, ref mic_valve)) = mic_branch {
+        pipeline.add_many(&[mic_src, mic_ac, mic_ar, mic_caps, mic_valve])
+            .map_err(|_| "Failed to add mic branch to pipeline".to_string())?;
+    }
+    if let Some(ref mixer) = audio_mixer {
+        pipeline.add(mixer).map_err(|_| "Failed to add audiomixer to pipeline".to_string())?;
+    }
 
     let src_factory = src.factory().unwrap().name();
     if src_factory == "d3d11screencapturesrc" {
@@ -851,15 +1146,60 @@ pub fn create_gstreamer_pipeline(
     rtcp_src.link_pads(Some("src"), &rtpbin, Some("recv_rtcp_sink_0"))
         .map_err(|e| format!("Failed to link rtcp_src to rtpbin: {:?}", e))?;
 
-    // Audio chain: capture → convert/resample → 48k/2ch caps → opus encode → RTP payload.
-    // Rides session 1 on the same rtpbin instance — keeps per-session SR/RR
-    // bookkeeping isolated from video while reusing one main loop / clock.
-    // The bus error handler removes this whole sub-graph at runtime if
-    // wasapi2src fails to open its endpoint.
-    gst::Element::link_many(&[
-        &audio_src, &audioconvert, &audioresample, &opus_capsfilter,
-        &opusenc, &rtpopuspay,
-    ]).map_err(|e| format!("Failed to link audio elements: {:?}", e))?;
+    // Audio chain: capture → convert/resample → 48k/2ch caps. When a mic was
+    // selected, both the system audio and mic feeds run into an audiomixer
+    // (mic via a `valve` for live mute/unmute), and the mixer's single output
+    // goes through Opus → RTP. Without a mic, system audio feeds the encoder
+    // directly. Rides rtpbin session 1; the bus error handler removes this
+    // whole sub-graph at runtime if WASAPI fails to open the endpoint.
+    if let (Some((mic_src, mic_ac, mic_ar, mic_caps, mic_valve)), Some(mixer)) =
+        (mic_branch.as_ref(), audio_mixer.as_ref())
+    {
+        gst::Element::link_many(&[
+            &audio_src, &audioconvert, &audioresample, &sys_audio_caps,
+        ]).map_err(|e| format!("Failed to link system audio chain: {:?}", e))?;
+        gst::Element::link_many(&[
+            mic_src, mic_ac, mic_ar, mic_caps, mic_valve,
+        ]).map_err(|e| format!("Failed to link mic audio chain: {:?}", e))?;
+
+        // audiomixer exposes request sink pads named sink_%u. Request them
+        // explicitly so each branch lands on its own pad — link() without an
+        // explicit pad name picks sink_0 for both branches and fails.
+        let sys_sink = mixer.request_pad_simple("sink_%u")
+            .ok_or_else(|| "audiomixer refused sink request for system audio".to_string())?;
+        let mic_sink = mixer.request_pad_simple("sink_%u")
+            .ok_or_else(|| "audiomixer refused sink request for mic".to_string())?;
+        sys_audio_caps.static_pad("src")
+            .ok_or_else(|| "sys_audio_caps has no src pad".to_string())?
+            .link(&sys_sink)
+            .map_err(|e| format!("Failed to link system audio into mixer: {:?}", e))?;
+        mic_valve.static_pad("src")
+            .ok_or_else(|| "mic_valve has no src pad".to_string())?
+            .link(&mic_sink)
+            .map_err(|e| format!("Failed to link mic into mixer: {:?}", e))?;
+
+        // audiomixer's src pad was observed negotiating MONO 48k F32 even
+        // when both its sinks were configured stereo via capsfilters with an
+        // explicit channel-mask — opus_capsfilter alone (channels=2, no
+        // channel-mask) wasn't enough to keep stereo on the mixer's src side,
+        // and the resulting mono Opus stream rendered silent on consumers
+        // expecting 2 channels. The post-mixer audioconvert reshapes
+        // whatever the mixer emits back to stereo before Opus encode.
+        let mixer_out_convert = gst::ElementFactory::make("audioconvert")
+            .name("mixer_out_convert")
+            .build()
+            .map_err(|_| "Failed to create mixer_out_convert".to_string())?;
+        pipeline.add(&mixer_out_convert)
+            .map_err(|_| "Failed to add mixer_out_convert to pipeline".to_string())?;
+
+        gst::Element::link_many(&[mixer, &mixer_out_convert, &opus_capsfilter, &opusenc, &rtpopuspay])
+            .map_err(|e| format!("Failed to link mixer to opus chain: {:?}", e))?;
+    } else {
+        gst::Element::link_many(&[
+            &audio_src, &audioconvert, &audioresample, &sys_audio_caps, &opus_capsfilter,
+            &opusenc, &rtpopuspay,
+        ]).map_err(|e| format!("Failed to link audio elements: {:?}", e))?;
+    }
 
     rtpopuspay.link_pads(Some("src"), &rtpbin, Some("send_rtp_sink_1"))
         .map_err(|e| format!("Failed to link rtpopuspay to rtpbin: {:?}", e))?;
@@ -1000,7 +1340,10 @@ pub fn create_gstreamer_pipeline(
     let state_change_result = pipeline.set_state(gst::State::Playing);
     match state_change_result {
         Ok(_) => println!("Pipeline state change initiated successfully"),
-        Err(e) => return Err(format!("Failed to start pipeline: {:?}", e)),
+        Err(e) => {
+            let extra = drain_bus_errors(&pipeline);
+            return Err(format!("Failed to start pipeline: {:?}{}", e, extra));
+        }
     }
 
     // Wait for state change to complete with timeout
@@ -1010,7 +1353,8 @@ pub fn create_gstreamer_pipeline(
             println!("Pipeline current state: {:?}, pending: {:?}", current_state, pending_state);
         }
         Err(e) => {
-            return Err(format!("Failed to get pipeline state: {:?}", e));
+            let extra = drain_bus_errors(&pipeline);
+            return Err(format!("Failed to get pipeline state: {:?}{}", e, extra));
         }
     }
 
@@ -1136,19 +1480,24 @@ pub fn start_streaming(
     audio_rtcp_port: u16,
     window_handle: Option<u64>,
     process_pid: Option<u32>,
+    mic_enabled: bool,
+    mic_device_id: Option<String>,
+    mic_initially_muted: bool,
 ) -> Result<String, String> {
     init()?;
 
     println!(
-        "video {}:{}/{}  audio {}:{}/{}",
+        "video {}:{}/{}  audio {}:{}/{}  mic_enabled={} mic_device={:?} mic_initially_muted={}",
         video_host, video_rtp_port, video_rtcp_port,
         audio_host, audio_rtp_port, audio_rtcp_port,
+        mic_enabled, mic_device_id, mic_initially_muted,
     );
 
     create_gstreamer_pipeline(
         &video_host, video_rtp_port, video_rtcp_port,
         &audio_host, audio_rtp_port, audio_rtcp_port,
         window_handle, process_pid,
+        mic_enabled, mic_device_id, mic_initially_muted,
     )?;
 
     Ok("Streaming started successfully".to_string())
