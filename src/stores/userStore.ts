@@ -47,21 +47,31 @@ export const useUserStore = defineStore('user', {
                 const store = await getStore()
                 const name = await store.get<string>('name')
                 const sessionHash = await store.get<string>('sessionHash')
+                console.log('[userStore] hydrate: stored name=', name, 'hasToken=', !!sessionHash)
                 if (!name || !sessionHash) {
                     return
                 }
                 try {
                     const response = await useHttp('GET', 'user', undefined, sessionHash)
+                    console.log('[userStore] hydrate: /api/user status=', response.status)
                     if (response.ok) {
                         this.name = name
                         this.sessionHash = sessionHash
                         this.isLoggedIn = true
-                    } else {
+                    } else if (response.status === 401 || response.status === 403) {
+                        console.warn('[userStore] Token rejected by server (', response.status, '), clearing credentials')
                         await this.logout()
+                    } else {
+                        console.warn('[userStore] Unexpected status from /api/user:', response.status, '— keeping stored session')
+                        this.name = name
+                        this.sessionHash = sessionHash
+                        this.isLoggedIn = true
                     }
                 } catch (err) {
-                    console.error('[userStore] Session validation failed:', err)
-                    await this.logout()
+                    console.warn('[userStore] Network error during session validation, keeping stored session:', err)
+                    this.name = name
+                    this.sessionHash = sessionHash
+                    this.isLoggedIn = true
                 }
             } finally {
                 this.hydrating = false
