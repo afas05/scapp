@@ -84,7 +84,7 @@ pub fn enumerate_windows() -> Result<Vec<WindowInfo>, String> {
                 }
             })
             .or_else(|| {
-                get_property(&conn, false, win, AtomEnum::WM_NAME.into(), AtomEnum::STRING, 0, 256)
+                get_property(&conn, false, win, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 256)
                     .ok()
                     .and_then(|cookie| cookie.reply().ok())
                     .and_then(|reply| String::from_utf8(reply.value).ok())

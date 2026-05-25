@@ -1,15 +1,10 @@
-use std::fs;
-use std::path::{Path, PathBuf};
-
 fn main() {
     tauri_build::build();
 
     #[cfg(target_os = "windows")]
     {
-        // Windows resolves DLL imports at process startup against the EXE's
-        // directory — not subfolders. Runtime GStreamer DLLs must sit next to
-        // scapp.exe. Plugins are loaded later via GST_PLUGIN_PATH in a
-        // `gstreamer-1.0/` subfolder. On Linux, GStreamer is system-installed.
+        use std::fs;
+        use std::path::PathBuf;
 
         let manifest_dir = PathBuf::from(env_var("CARGO_MANIFEST_DIR"));
         let target_dir = locate_target_dir();
@@ -32,8 +27,8 @@ fn main() {
 }
 
 #[cfg(target_os = "windows")]
-fn copy_dlls(src: &Path, dest: &Path) {
-    let entries = match fs::read_dir(src) {
+fn copy_dlls(src: &std::path::Path, dest: &std::path::Path) {
+    let entries = match std::fs::read_dir(src) {
         Ok(e) => e,
         Err(_) => return,
     };
@@ -56,13 +51,13 @@ fn copy_dlls(src: &Path, dest: &Path) {
                 }
             }
         }
-        let _ = fs::copy(&path, &dest_path);
+        let _ = std::fs::copy(&path, &dest_path);
     }
 }
 
 #[cfg(target_os = "windows")]
-fn locate_target_dir() -> PathBuf {
-    let out_dir = PathBuf::from(env_var("OUT_DIR"));
+fn locate_target_dir() -> std::path::PathBuf {
+    let out_dir = std::path::PathBuf::from(env_var("OUT_DIR"));
     out_dir
         .ancestors()
         .nth(3)
