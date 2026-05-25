@@ -31,6 +31,7 @@ fn main() {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn copy_dlls(src: &Path, dest: &Path) {
     let entries = match fs::read_dir(src) {
         Ok(e) => e,
@@ -59,6 +60,7 @@ fn copy_dlls(src: &Path, dest: &Path) {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn locate_target_dir() -> PathBuf {
     let out_dir = PathBuf::from(env_var("OUT_DIR"));
     out_dir
@@ -68,6 +70,7 @@ fn locate_target_dir() -> PathBuf {
         .unwrap_or(out_dir)
 }
 
+#[cfg(target_os = "windows")]
 fn env_var(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("missing env var {}", name))
 }

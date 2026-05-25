@@ -1,6 +1,5 @@
 {
   "bundle": {
-    "targets": ["deb", "appimage"],
-    "resources": {}
+    "targets": ["deb", "appimage"]
   }
 }
