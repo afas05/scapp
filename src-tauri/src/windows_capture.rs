@@ -12,8 +12,10 @@ pub struct WindowInfo {
 pub fn enumerate_windows() -> Result<Vec<WindowInfo>, String> {
     #[cfg(windows)]
     return win::enumerate();
-    #[cfg(not(windows))]
-    Err("Window enumeration is only supported on Windows".to_string())
+    #[cfg(target_os = "linux")]
+    return crate::linux_capture::enumerate_windows();
+    #[cfg(not(any(windows, target_os = "linux")))]
+    Err("Window enumeration is not supported on this platform".to_string())
 }
 
 #[cfg(windows)]

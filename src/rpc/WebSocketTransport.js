@@ -20,7 +20,7 @@ export function createWebSocketTransport(url, token) {
             resolve({ rpc, close: () => ws.close() });
         };
 
-        ws.onerror = (err) => reject(err);
+        ws.onerror = () => reject(new Error('WebSocket connection failed (check auth token or server availability)'));
 
         ws.onclose = () => {
             rpc.clean('WebSocket closed');

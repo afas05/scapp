@@ -1,6 +1,6 @@
 [package]
 name = "scapp"
-version = "0.4.1"
+version = "0.5.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -46,3 +46,6 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Dwm",
     "Win32_Storage_Xps",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["composite", "randr"] }

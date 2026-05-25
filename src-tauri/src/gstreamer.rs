@@ -53,6 +53,7 @@ pub struct MicDevice {
 // device back up at start_streaming time so wasapi2src is built via
 // `Device::create_element`, which configures every internal endpoint property
 // the plugin needs (not just the `device` GObject property).
+#[cfg(target_os = "linux")]
 fn enumerate_audio_input_devices() -> Vec<(gst::Device, String, String, bool)> {
     let monitor = gst::DeviceMonitor::new();
     let caps = gst::Caps::new_empty_simple("audio/x-raw");
@@ -68,16 +69,70 @@ fn enumerate_audio_input_devices() -> Vec<(gst::Device, String, String, bool)> {
         let name = device.display_name().to_string();
         let props = device.properties();
 
-        // The DeviceMonitor exposes Audio/Source devices from EVERY registered
-        // provider (wasapi2, directsound, dshow, ksvideosrc, …). Each provider
-        // stamps device IDs in its own format that only its matching `*src`
-        // element understands. If we accept a non-wasapi2 device into the
-        // returned list, our `Device::create_element` call at start_streaming
-        // time builds a non-wasapi2 source element (e.g. `directsoundsrc`)
-        // and the rest of the wasapi2-only mic chain falls apart — or worse,
-        // the fallback path constructs `wasapi2src device=<dshow-id>` which
-        // silently fails endpoint lookup and opens the default device
-        // instead. Strict wasapi2-only enumeration prevents both modes.
+        // Accept pulseaudio and pipewire sources only.
+        let api_ok = props
+            .as_ref()
+            .and_then(|p| p.get::<String>("device.api").ok())
+            .map(|v| v == "pulseaudio" || v == "pipewire")
+            .unwrap_or(false);
+        if !api_ok {
+            continue;
+        }
+
+        // Skip monitor sources (system audio loopback) — not mic inputs.
+        let is_monitor = props.as_ref()
+            .and_then(|p| p.get::<String>("device.class").ok())
+            .map(|c| c == "monitor")
+            .unwrap_or(false);
+        if is_monitor {
+            continue;
+        }
+
+        let id = props.as_ref()
+            .and_then(|p| {
+                p.get::<String>("node.name")
+                    .or_else(|_| p.get::<String>("device.name"))
+                    .or_else(|_| p.get::<String>("object.id"))
+                    .ok()
+            })
+            .unwrap_or_else(|| name.clone());
+
+        if id.is_empty() || !seen_ids.insert(id.clone()) {
+            continue;
+        }
+
+        let is_default = props.as_ref()
+            .and_then(|p| p.get::<bool>("is-default").ok())
+            .unwrap_or(false);
+
+        out.push((device, id, name, is_default));
+    }
+
+    monitor.stop();
+
+    if !out.is_empty() && !out.iter().any(|(_, _, _, def)| *def) {
+        out[0].3 = true;
+    }
+
+    out
+}
+
+#[cfg(windows)]
+fn enumerate_audio_input_devices() -> Vec<(gst::Device, String, String, bool)> {
+    let monitor = gst::DeviceMonitor::new();
+    let caps = gst::Caps::new_empty_simple("audio/x-raw");
+    let _ = monitor.add_filter(Some("Audio/Source"), Some(&caps));
+    if monitor.start().is_err() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<(gst::Device, String, String, bool)> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for device in monitor.devices() {
+        let name = device.display_name().to_string();
+        let props = device.properties();
+
         let api_ok = props
             .as_ref()
             .and_then(|p| p.get::<String>("device.api").ok())
@@ -88,16 +143,6 @@ fn enumerate_audio_input_devices() -> Vec<(gst::Device, String, String, bool)> {
             continue;
         }
 
-        // The wasapi2 device provider exposes EVERY render endpoint a second
-        // time as an Audio/Source "loopback proxy" — the device appears with
-        // the speaker/headphone's display name (e.g. "Speakers (HyperX …)")
-        // and `Device::create_element` builds a `wasapi2src` with
-        // `loopback=true` wired in. Picking such an entry as a mic actually
-        // captures whatever is playing through those speakers, not the user's
-        // microphone. Build a throwaway element via the device provider and
-        // inspect its `loopback` property — if it's true, skip the entry
-        // outright. We reuse the same temp element to pull the canonical
-        // `device` string when the property-bag path didn't expose it.
         let temp_el = device.create_element(None).ok();
         let is_loopback = temp_el
             .as_ref()
@@ -108,10 +153,6 @@ fn enumerate_audio_input_devices() -> Vec<(gst::Device, String, String, bool)> {
             continue;
         }
 
-        // Try every plausible field where the wasapi2 provider stamps its
-        // endpoint id. The temp-element fallback is last because some builds
-        // return an element with no `device` set — the canonical answer is
-        // in `properties`.
         let id: Option<String> = props
             .as_ref()
             .and_then(|p| {
@@ -265,6 +306,349 @@ fn configure_nvenc(enc: &gst::Element) {
     }
 }
 
+fn configure_encoder(enc: &gst::Element) {
+    let factory = enc.factory().map(|f| f.name().to_string()).unwrap_or_default();
+    if factory.contains("nvh264enc") || factory.contains("nvd3d11h264enc") {
+        configure_nvenc(enc);
+    } else if factory.contains("vaapi") || factory.contains("va") {
+        if enc.find_property("rate-control").is_some() {
+            enc.set_property_from_str("rate-control", "cbr");
+        }
+        if enc.find_property("bitrate").is_some() {
+            enc.set_property("bitrate", 20000u32);
+        }
+        if enc.find_property("keyframe-period").is_some() {
+            enc.set_property("keyframe-period", 120u32);
+        }
+        if enc.find_property("cabac").is_some() {
+            enc.set_property("cabac", true);
+        }
+    } else if factory == "x264enc" {
+        enc.set_property("bitrate", 20000u32);
+        enc.set_property_from_str("tune", "zerolatency");
+        enc.set_property_from_str("speed-preset", "superfast");
+        enc.set_property("key-int-max", 120u32);
+        enc.set_property("bframes", 0u32);
+    }
+}
+
+// --- Platform-specific video source creation ---
+
+#[cfg(target_os = "linux")]
+fn create_video_source(window_handle: Option<u64>) -> Result<gst::Element, String> {
+    let use_window_capture = window_handle.filter(|&h| h != 0).is_some();
+
+    if use_window_capture {
+        if let Ok(el) = gst::ElementFactory::make("ximagesrc").name("screensrc").build() {
+            return Ok(el);
+        }
+        return Err("ximagesrc unavailable — required for X11 window capture".to_string());
+    }
+
+    if let Ok(el) = gst::ElementFactory::make("pipewiresrc").name("screensrc").build() {
+        return Ok(el);
+    }
+    println!("[GStreamer] pipewiresrc not available, trying ximagesrc...");
+    if let Ok(el) = gst::ElementFactory::make("ximagesrc").name("screensrc").build() {
+        return Ok(el);
+    }
+    println!("[GStreamer] ximagesrc not available, using videotestsrc fallback");
+    gst::ElementFactory::make("videotestsrc")
+        .name("screensrc")
+        .build()
+        .map_err(|_| "Failed to create any video source element".to_string())
+}
+
+#[cfg(windows)]
+fn create_video_source(window_handle: Option<u64>) -> Result<gst::Element, String> {
+    let use_window_capture = window_handle.filter(|&h| h != 0).is_some();
+
+    if use_window_capture {
+        return gst::ElementFactory::make("d3d11screencapturesrc")
+            .name("d3d11screencapturesrc")
+            .build()
+            .map_err(|_| "d3d11screencapturesrc unavailable — required for window capture".to_string());
+    }
+
+    match gst::ElementFactory::make("d3d11screencapturesrc")
+        .name("d3d11screencapturesrc")
+        .build()
+    {
+        Ok(element) => Ok(element),
+        Err(_) => {
+            println!("d3d11screencapturesrc not available, trying d3d12...");
+            match gst::ElementFactory::make("d3d12screencapturesrc")
+                .name("d3d12screencapturesrc")
+                .build()
+            {
+                Ok(element) => Ok(element),
+                Err(_) => {
+                    println!("d3d12screencapturesrc not available, trying alternative sources...");
+                    match gst::ElementFactory::make("dx9screencapsrc")
+                        .name("dx9screencapsrc")
+                        .build()
+                    {
+                        Ok(element) => Ok(element),
+                        Err(_) => {
+                            println!("Using videotestsrc as fallback");
+                            gst::ElementFactory::make("videotestsrc")
+                                .name("videotestsrc")
+                                .build()
+                                .map_err(|_| "Failed to create any video source element".to_string())
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --- Platform-specific video source configuration ---
+
+#[cfg(target_os = "linux")]
+fn configure_video_source(src: &gst::Element, window_handle: Option<u64>) {
+    let factory = src.factory().unwrap().name();
+    if factory == "ximagesrc" {
+        src.set_property("use-damage", false);
+        src.set_property("show-pointer", true);
+        if let Some(xid) = window_handle.filter(|&h| h != 0) {
+            src.set_property("xid", xid);
+        }
+    } else if factory == "videotestsrc" {
+        src.set_property_from_str("pattern", "smpte");
+        src.set_property("is-live", true);
+    }
+    // pipewiresrc: screen selection handled by xdg-desktop-portal dialog
+}
+
+#[cfg(windows)]
+fn configure_video_source(src: &gst::Element, window_handle: Option<u64>) {
+    let src_factory = src.factory().unwrap().name();
+    if src_factory == "d3d11screencapturesrc" {
+        src.set_property("show-cursor", &true);
+        if let Some(hwnd) = window_handle.filter(|&h| h != 0) {
+            src.set_property_from_str("capture-api", "wgc");
+            src.set_property("window-handle", hwnd);
+        } else {
+            src.set_property_from_str("capture-api", "wgc");
+            src.set_property("monitor-index", &0i32);
+        }
+    } else if src_factory == "d3d12screencapturesrc" || src_factory == "dx9screencapsrc" {
+        src.set_property("show-cursor", &true);
+        src.set_property("monitor-index", &0i32);
+    } else if src_factory == "videotestsrc" {
+        src.set_property_from_str("pattern", "smpte");
+        src.set_property("is-live", true);
+    }
+}
+
+// --- Platform-specific video encoder creation ---
+
+#[cfg(target_os = "linux")]
+fn create_video_encoder(_src_factory_name: &str) -> Result<gst::Element, String> {
+    let candidates = ["nvh264enc", "vaapih264enc", "vah264enc", "x264enc"];
+    for name in candidates {
+        if let Ok(enc) = gst::ElementFactory::make(name).name("videoenc").build() {
+            println!("[GStreamer] Using video encoder: {}", name);
+            return Ok(enc);
+        }
+    }
+    Err("No H.264 encoder available (tried nvh264enc, vaapih264enc, vah264enc, x264enc)".to_string())
+}
+
+#[cfg(windows)]
+fn create_video_encoder(src_factory_name: &str) -> Result<gst::Element, String> {
+    let videoenc_factory = if src_factory_name == "d3d11screencapturesrc" {
+        "nvd3d11h264enc"
+    } else {
+        "nvh264enc"
+    };
+    gst::ElementFactory::make(videoenc_factory)
+        .name("videoenc")
+        .build()
+        .map_err(|_| format!("{} unavailable — required for hardware H.264 encode", videoenc_factory))
+}
+
+// --- Platform-specific system audio source creation ---
+
+#[cfg(target_os = "linux")]
+fn create_system_audio_source(_process_pid: Option<u32>) -> Result<gst::Element, String> {
+    let src = gst::ElementFactory::make("pulsesrc")
+        .name("system_audio_src")
+        .build()
+        .map_err(|_| "Failed to create pulsesrc for system audio".to_string())?;
+
+    // PulseAudio monitor sources capture whatever is playing on an output
+    // sink. Find the default output's monitor for system audio loopback.
+    let monitor = find_default_monitor_source();
+    if let Some(monitor_name) = monitor {
+        println!("[GStreamer] Using PulseAudio monitor: {}", monitor_name);
+        src.set_property("device", &monitor_name);
+    }
+
+    Ok(src)
+}
+
+#[cfg(target_os = "linux")]
+fn find_default_monitor_source() -> Option<String> {
+    let monitor = gst::DeviceMonitor::new();
+    let caps = gst::Caps::new_empty_simple("audio/x-raw");
+    let _ = monitor.add_filter(Some("Audio/Source"), Some(&caps));
+    if monitor.start().is_err() {
+        return None;
+    }
+
+    let mut result = None;
+    for device in monitor.devices() {
+        let props = device.properties();
+        let is_monitor = props.as_ref()
+            .and_then(|p| p.get::<String>("device.class").ok())
+            .map(|c| c == "monitor")
+            .unwrap_or(false);
+        if !is_monitor {
+            continue;
+        }
+        let device_name = props.as_ref()
+            .and_then(|p| p.get::<String>("node.name")
+                .or_else(|_| p.get::<String>("device.name"))
+                .ok());
+        if let Some(name) = device_name {
+            result = Some(name);
+            break;
+        }
+    }
+    monitor.stop();
+    result
+}
+
+#[cfg(windows)]
+fn create_system_audio_source(process_pid: Option<u32>) -> Result<gst::Element, String> {
+    let audio_src = gst::ElementFactory::make("wasapi2src")
+        .name("system_audio_src")
+        .build()
+        .map_err(|_| "Failed to create wasapi2src element".to_string())?;
+    audio_src.set_property("loopback", true);
+    audio_src.set_property("low-latency", true);
+    if let Some(pid) = process_pid.filter(|&p| p != 0) {
+        let mode_set = audio_src.find_property("loopback-mode").is_some();
+        let pid_set = audio_src.find_property("loopback-target-pid").is_some();
+        if mode_set && pid_set {
+            audio_src.set_property_from_str("loopback-mode", "include-process-tree");
+            audio_src.set_property("loopback-target-pid", pid);
+        }
+    }
+    Ok(audio_src)
+}
+
+// --- Platform-specific mic source creation ---
+
+#[cfg(target_os = "linux")]
+fn create_mic_source(dev_id: &str) -> Result<gst::Element, String> {
+    let devices = enumerate_audio_input_devices();
+    let device_match = devices.into_iter().find(|(_, id, _, _)| id == dev_id);
+    match device_match {
+        Some((dev, _, _, _)) => dev
+            .create_element(Some("mic_src"))
+            .map_err(|e| format!("Failed to create mic element from device: {:?}", e)),
+        None => {
+            let el = gst::ElementFactory::make("pulsesrc")
+                .name("mic_src")
+                .build()
+                .map_err(|_| "Failed to create pulsesrc for mic input".to_string())?;
+            el.set_property("device", dev_id);
+            Ok(el)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_mic_source(dev_id: &str) -> Result<gst::Element, String> {
+    let devices = enumerate_audio_input_devices();
+    let device_match = devices.into_iter().find(|(_, id, _, _)| id == dev_id);
+    match device_match {
+        Some((dev, _, _, _)) => dev
+            .create_element(Some("mic_src"))
+            .map_err(|e| format!("Failed to create mic element from device: {:?}", e)),
+        None => {
+            let el = gst::ElementFactory::make("wasapi2src")
+                .name("mic_src")
+                .build()
+                .map_err(|_| "Failed to create wasapi2src for mic input".to_string())?;
+            el.set_property("device", dev_id);
+            Ok(el)
+        }
+    }
+}
+
+// --- Platform-specific video chain linking ---
+
+#[cfg(target_os = "linux")]
+fn link_video_chain(
+    pipeline: &gst::Pipeline,
+    src: &gst::Element,
+    videoconvert: &gst::Element,
+    videoscale: &gst::Element,
+    capsfilter: &gst::Element,
+    videoenc: &gst::Element,
+    h264_capsfilter: &gst::Element,
+    rtph264pay: &gst::Element,
+) -> Result<(), String> {
+    pipeline.add_many(&[videoconvert, videoscale, capsfilter])
+        .map_err(|_| "Failed to add convert/scale/capsfilter to pipeline".to_string())?;
+    gst::Element::link_many(&[src, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter, rtph264pay])
+        .map_err(|e| format!("Failed to link video elements: {:?}", e))
+}
+
+#[cfg(windows)]
+fn link_video_chain(
+    pipeline: &gst::Pipeline,
+    src: &gst::Element,
+    videoconvert: &gst::Element,
+    videoscale: &gst::Element,
+    capsfilter: &gst::Element,
+    videoenc: &gst::Element,
+    h264_capsfilter: &gst::Element,
+    rtph264pay: &gst::Element,
+) -> Result<(), String> {
+    let src_factory = src.factory().unwrap().name();
+    if src_factory == "d3d11screencapturesrc" {
+        let d3d11convert = gst::ElementFactory::make("d3d11convert")
+            .name("d3d11convert")
+            .build()
+            .map_err(|_| "d3d11convert unavailable — required for d3d11 zero-copy path".to_string())?;
+        let d3d11_capsfilter = gst::ElementFactory::make("capsfilter")
+            .name("d3d11_capsfilter")
+            .build()
+            .map_err(|_| "Failed to create d3d11 capsfilter element".to_string())?;
+        let d3d11_caps = gst::Caps::builder("video/x-raw")
+            .features(["memory:D3D11Memory"])
+            .field("format", "NV12")
+            .field("width", 1920i32)
+            .field("height", 1080i32)
+            .field("framerate", gst::Fraction::new(60, 1))
+            .build();
+        d3d11_capsfilter.set_property("caps", &d3d11_caps);
+        pipeline.add_many(&[&d3d11convert, &d3d11_capsfilter])
+            .map_err(|_| "Failed to add d3d11 zero-copy elements to pipeline".to_string())?;
+        gst::Element::link_many(&[src, &d3d11convert, &d3d11_capsfilter, videoenc, h264_capsfilter, rtph264pay])
+            .map_err(|e| format!("Failed to link d3d11 zero-copy chain: {:?}", e))
+    } else if src_factory == "d3d12screencapturesrc" {
+        pipeline.add_many(&[videoconvert, videoscale, capsfilter])
+            .map_err(|_| "Failed to add convert/scale/capsfilter to pipeline".to_string())?;
+        let d3d12download = gst::ElementFactory::make("d3d12download")
+            .build()
+            .map_err(|_| "d3d12screencapturesrc requires the d3d12download element".to_string())?;
+        pipeline.add(&d3d12download).map_err(|_| "Failed to add d3d12download to pipeline".to_string())?;
+        gst::Element::link_many(&[src, &d3d12download, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter, rtph264pay])
+            .map_err(|e| format!("Failed to link video elements with d3d12download: {:?}", e))
+    } else {
+        pipeline.add_many(&[videoconvert, videoscale, capsfilter])
+            .map_err(|_| "Failed to add convert/scale/capsfilter to pipeline".to_string())?;
+        gst::Element::link_many(&[src, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter, rtph264pay])
+            .map_err(|e| format!("Failed to link video elements: {:?}", e))
+    }
+}
+
 // Caps probe callback
 fn caps_probe_cb(_pad: &gst::Pad, info: &mut gst::PadProbeInfo) -> gst::PadProbeReturn {
     if let Some(event) = info.event() {
@@ -297,14 +681,14 @@ fn find_pipeline(start: &gst::Object) -> Option<gst::Pipeline> {
     None
 }
 
-// Tear the audio chain out of a running pipeline so a wasapi2src failure
-// can't take video down with it. WASAPI failure leaves the source in ERROR
-// state, which propagates GST_FLOW_ERROR upstream through rtpbin's session 1
-// and blocks data flow on the shared rtpbin — so we unlink the session-1
-// pads, set the audio elements to NULL, and remove them entirely.
+// Tear the audio chain out of a running pipeline so an audio source failure
+// can't take video down with it. The source failure leaves the element in
+// ERROR state, which propagates GST_FLOW_ERROR upstream through rtpbin's
+// session 1 and blocks data flow on the shared rtpbin — so we unlink the
+// session-1 pads, set the audio elements to NULL, and remove them entirely.
 fn disable_audio_chain(pipeline: &gst::Pipeline) -> bool {
     let names = [
-        "wasapi2src", "audioconvert", "audioresample", "sys_audio_caps",
+        "system_audio_src", "audioconvert", "audioresample", "sys_audio_caps",
         "mic_src", "mic_audioconvert", "mic_audioresample", "mic_caps", "mic_valve",
         "audio_mixer",
         "opus_capsfilter", "opusenc", "rtpopuspay",
@@ -402,21 +786,19 @@ fn bus_call(_bus: &gst::Bus, msg: &gst::Message) -> glib::ControlFlow {
                 err.debug()
             );
 
-            // wasapi2src can fail to open at runtime (no playback device,
-            // exclusive-mode contention, per-process loopback target with no
-            // audio sessions). Isolate the failure to the audio chain so the
-            // video stream keeps flowing — returning Break here would kill
-            // the bus watch and leave the pipeline with an element stuck in
-            // ERROR, blocking data flow upstream through rtpbin.
+            // Audio source can fail to open at runtime (no playback device,
+            // exclusive-mode contention, missing PulseAudio/WASAPI session).
+            // Isolate the failure to the audio chain so the video stream
+            // keeps flowing.
             let from_audio = err.src()
                 .map(|s| s.path_string().to_string())
-                .map(|p| p.contains("wasapi2src") || p.contains("mic_src"))
+                .map(|p| p.contains("system_audio_src") || p.contains("mic_src"))
                 .unwrap_or(false);
             if from_audio {
                 if let Some(src) = err.src() {
                     if let Some(pipeline) = find_pipeline(&src) {
                         if disable_audio_chain(&pipeline) {
-                            eprintln!("[GStreamer] Audio chain disabled after wasapi2src error; video continues");
+                            eprintln!("[GStreamer] Audio chain disabled after audio source error; video continues");
                             return glib::ControlFlow::Continue;
                         }
                     }
@@ -508,54 +890,8 @@ pub fn create_gstreamer_pipeline(
         .build()
         .map_err(|_| "Failed to create rtpbin element".to_string())?;
 
-    // d3d12screencapturesrc has no window-handle property; only d3d11 does.
-    // Pick the source based on whether the user asked to capture a window.
-    let use_window_capture = window_handle.filter(|&h| h != 0).is_some();
-
-    // Prefer d3d11screencapturesrc for monitor capture too — it keeps frames
-    // in D3D11Memory through the zero-copy d3d11convert + nvd3d11h264enc
-    // chain below, avoiding the d3d12download + videoconvert + videoscale CPU
-    // hop that the d3d12 branch was forced through (nvh264enc can't ingest
-    // D3D12Memory directly). Fall back to d3d12 → dx9 → videotestsrc if d3d11
-    // isn't available on this build.
-    let src = if use_window_capture {
-        gst::ElementFactory::make("d3d11screencapturesrc")
-            .name("d3d11screencapturesrc")
-            .build()
-            .map_err(|_| "d3d11screencapturesrc unavailable — required for window capture".to_string())?
-    } else {
-        match gst::ElementFactory::make("d3d11screencapturesrc")
-            .name("d3d11screencapturesrc")
-            .build()
-        {
-            Ok(element) => element,
-            Err(_) => {
-                println!("d3d11screencapturesrc not available, trying d3d12...");
-                match gst::ElementFactory::make("d3d12screencapturesrc")
-                    .name("d3d12screencapturesrc")
-                    .build()
-                {
-                    Ok(element) => element,
-                    Err(_) => {
-                        println!("d3d12screencapturesrc not available, trying alternative sources...");
-                        match gst::ElementFactory::make("dx9screencapsrc")
-                            .name("dx9screencapsrc")
-                            .build()
-                        {
-                            Ok(element) => element,
-                            Err(_) => {
-                                println!("Using videotestsrc as fallback");
-                                gst::ElementFactory::make("videotestsrc")
-                                    .name("videotestsrc")
-                                    .build()
-                                    .map_err(|_| "Failed to create any video source element".to_string())?
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    };
+    let src = create_video_source(window_handle)?;
+    let src_factory_name = src.factory().unwrap().name().to_string();
 
     let videoconvert = gst::ElementFactory::make("videoconvert")
         .name("videoconvert")
@@ -572,23 +908,7 @@ pub fn create_gstreamer_pipeline(
         .build()
         .map_err(|_| "Failed to create capsfilter element".to_string())?;
 
-    // Encoder choice depends on the upstream memory type. For
-    // d3d11screencapturesrc we keep frames in D3D11 memory all the way through
-    // a GPU-resident convert/scale (`d3d11convert`) into `nvd3d11h264enc`,
-    // which consumes D3D11Memory directly. That avoids the CPU bottleneck of
-    // d3d11download + videoconvert + videoscale on 2560x1392 BGRA@60fps which
-    // can starve nvh264enc entirely. Other sources stay on `nvh264enc` with
-    // the existing system-memory chain.
-    let src_factory_name = src.factory().unwrap().name().to_string();
-    let videoenc_factory = if src_factory_name == "d3d11screencapturesrc" {
-        "nvd3d11h264enc"
-    } else {
-        "nvh264enc"
-    };
-    let videoenc = gst::ElementFactory::make(videoenc_factory)
-        .name("videoenc")
-        .build()
-        .map_err(|_| format!("{} unavailable — required for hardware H.264 encode", videoenc_factory))?;
+    let videoenc = create_video_encoder(&src_factory_name)?;
 
     // Forces the encoder negotiation to High profile — sharper output for
     // 1080p60 game footage. Must match profile-level-id advertised by the
@@ -619,14 +939,7 @@ pub fn create_gstreamer_pipeline(
         .build()
         .map_err(|_| "Failed to create udpsrc element".to_string())?;
 
-    // Audio capture + encode chain. wasapi2src loopback=true captures the
-    // system audio mix (what's playing on the streamer's speakers) — same
-    // semantics as a screen capture for the audio side. low-latency=true
-    // keeps the WASAPI buffer small so audio doesn't drift behind video.
-    let audio_src = gst::ElementFactory::make("wasapi2src")
-        .name("wasapi2src")
-        .build()
-        .map_err(|_| "Failed to create wasapi2src element".to_string())?;
+    let audio_src = create_system_audio_source(process_pid)?;
 
     let audioconvert = gst::ElementFactory::make("audioconvert")
         .name("audioconvert")
@@ -722,35 +1035,7 @@ pub fn create_gstreamer_pipeline(
     // mute) into sink_1. When no mic device is supplied, the original
     // single-source audio chain is used unchanged.
     let mic_branch = if let Some(ref dev_id) = mic_device_id {
-        // Re-enumerate at start time and look up the same device by stable id.
-        // `Device::create_element` builds a wasapi2src that's already wired to
-        // the right endpoint via internal device fields — setting only the
-        // `device` GObject property on a freshly-constructed wasapi2src isn't
-        // enough on some builds (the plugin opens the wrong endpoint or none).
-        let devices = enumerate_audio_input_devices();
-        let device_match = devices.into_iter().find(|(_, id, _, _)| id == dev_id);
-        let mic_src = match device_match {
-            Some((dev, _, _, _)) => dev
-                .create_element(Some("mic_src"))
-                .map_err(|e| format!("Failed to create mic element from device: {:?}", e))?,
-            None => {
-                let el = gst::ElementFactory::make("wasapi2src")
-                    .name("mic_src")
-                    .build()
-                    .map_err(|_| "Failed to create wasapi2src for mic input".to_string())?;
-                el.set_property("device", dev_id.as_str());
-                el
-            }
-        };
-        // Do NOT enable `low-latency` on the mic capture endpoint — it sets
-        // AUDCLNT_STREAMFLAGS_EVENTCALLBACK and asks for the device's minimum
-        // native period; many capture endpoints (USB mics, built-in arrays,
-        // anything with driver-side processing) reject that in shared mode
-        // and IAudioClient::Initialize fails with AUDCLNT_E_UNSUPPORTED_FORMAT
-        // — surfaced by the plugin as a bare "Failed to open device". The
-        // system-audio loopback branch uses a different WASAPI code path and
-        // tolerates low-latency, which is why copy-pasting that setting here
-        // was wrong.
+        let mic_src = create_mic_source(dev_id)?;
         let mic_audioconvert = gst::ElementFactory::make("audioconvert")
             .name("mic_audioconvert")
             .build()
@@ -815,22 +1100,6 @@ pub fn create_gstreamer_pipeline(
     } else {
         None
     };
-
-    // Loopback capture of the default render endpoint (system mix). The
-    // existing screen-capture mirror: viewers hear what the streamer hears.
-    audio_src.set_property("loopback", true);
-    audio_src.set_property("low-latency", true);
-    if let Some(pid) = process_pid.filter(|&p| p != 0) {
-        // Per-process loopback needs BOTH loopback-mode=include-process-tree
-        // AND loopback-target-pid. Default loopback-mode captures the full
-        // system mix even when target-pid is set.
-        let mode_set = audio_src.find_property("loopback-mode").is_some();
-        let pid_set = audio_src.find_property("loopback-target-pid").is_some();
-        if mode_set && pid_set {
-            audio_src.set_property_from_str("loopback-mode", "include-process-tree");
-            audio_src.set_property("loopback-target-pid", pid);
-        }
-    }
 
     // 128 kbps stereo Opus tuned for general audio. frame-size=20 ms is the
     // common WebRTC default and matches what browser consumers expect.
@@ -948,45 +1217,8 @@ pub fn create_gstreamer_pipeline(
         Some(glib::Value::from(&bin))
     });
 
-    // Configure source based on type. Enum-typed properties on plugin
-    // elements (e.g. videotestsrc.pattern) must be set via the nick string —
-    // gstreamer-rs can't coerce a raw i32 to a plugin-defined GEnum.
-    let src_factory = src.factory().unwrap().name();
-    if src_factory == "d3d11screencapturesrc" {
-        src.set_property("show-cursor", &true);
-        if let Some(hwnd) = window_handle.filter(|&h| h != 0) {
-            // window-handle is honored only by the WGC backend; the default
-            // DXGI Desktop Duplication path ignores it and produces no frames.
-            src.set_property_from_str("capture-api", "wgc");
-            src.set_property("window-handle", hwnd);
-        } else {
-            // WGC backend also handles monitor capture and tracks the actual
-            // present rate of the target surface — important for fullscreen
-            // games where DXGI Desktop Duplication clamps to a fraction of
-            // monitor refresh (observed: 48 fps capture from a 144 Hz / 144 fps
-            // game). WGC requires Windows 10 1903+; falls back to DXGI if not
-            // available on this build.
-            src.set_property_from_str("capture-api", "wgc");
-            src.set_property("monitor-index", &0i32);
-        }
-    } else if src_factory == "d3d12screencapturesrc" || src_factory == "dx9screencapsrc" {
-        src.set_property("show-cursor", &true);
-        src.set_property("monitor-index", &0i32);
-    } else if src_factory == "videotestsrc" {
-        src.set_property_from_str("pattern", "smpte");
-        src.set_property("is-live", true);
-    }
-
-    // iperf3 confirmed the link carries 30 Mbps UDP cleanly with 0% loss to
-    // this server — so packet loss in the pipeline is not a bandwidth problem,
-    // it's a burstiness problem. NVENC emits an entire frame as a single send;
-    // an IDR at 60 fps can dump ~200 KB into the socket in microseconds and
-    // overflow whatever queue (router, kernel, mediasoup recv buffer) sits at
-    // the bottleneck — even though the average rate fits comfortably.
-    //
-    // 20 Mbps CBR + a 400 ms VBV window bounds per-frame size variance so
-    // IDRs and scene changes can't blow out into a single megaburst.
-    configure_nvenc(&videoenc);
+    configure_video_source(&src, window_handle);
+    configure_encoder(&videoenc);
 
     rtph264pay.set_property("ssrc", VIDEO_SSRC);
     rtph264pay.set_property("pt", 100u32); // Must match payloadType declared by frontend
@@ -1071,52 +1303,7 @@ pub fn create_gstreamer_pipeline(
         pipeline.add(mixer).map_err(|_| "Failed to add audiomixer to pipeline".to_string())?;
     }
 
-    let src_factory = src.factory().unwrap().name();
-    if src_factory == "d3d11screencapturesrc" {
-        // Zero-copy GPU chain: capture stays in D3D11Memory, d3d11convert
-        // handles BGRA→NV12 + rescale to 1920x1080 on the GPU,
-        // nvd3d11h264enc encodes directly from D3D11Memory via NVENC. This
-        // eliminates the d3d11download + videoconvert + videoscale CPU
-        // bottleneck that starves nvh264enc on a 2560x1392@60 BGRA stream.
-        let d3d11convert = gst::ElementFactory::make("d3d11convert")
-            .name("d3d11convert")
-            .build()
-            .map_err(|_| "d3d11convert unavailable — required for d3d11 zero-copy path".to_string())?;
-        let d3d11_capsfilter = gst::ElementFactory::make("capsfilter")
-            .name("d3d11_capsfilter")
-            .build()
-            .map_err(|_| "Failed to create d3d11 capsfilter element".to_string())?;
-        let d3d11_caps = gst::Caps::builder("video/x-raw")
-            .features(["memory:D3D11Memory"])
-            .field("format", "NV12")
-            .field("width", 1920i32)
-            .field("height", 1080i32)
-            .field("framerate", gst::Fraction::new(60, 1))
-            .build();
-        d3d11_capsfilter.set_property("caps", &d3d11_caps);
-        pipeline.add_many(&[&d3d11convert, &d3d11_capsfilter])
-            .map_err(|_| "Failed to add d3d11 zero-copy elements to pipeline".to_string())?;
-        gst::Element::link_many(&[&src, &d3d11convert, &d3d11_capsfilter, &videoenc, &h264_capsfilter, &rtph264pay])
-            .map_err(|e| format!("Failed to link d3d11 zero-copy chain: {:?}", e))?;
-    } else if src_factory == "d3d12screencapturesrc" {
-        // d3d12 path: still uses the system-memory chain because nvh264enc
-        // doesn't accept D3D12Memory directly. d3d12download lands frames in
-        // sysmem; videoconvert + videoscale handle BGRA→NV12 + rescale.
-        pipeline.add_many(&[&videoconvert, &videoscale, &capsfilter])
-            .map_err(|_| "Failed to add convert/scale/capsfilter to pipeline".to_string())?;
-        let d3d12download = gst::ElementFactory::make("d3d12download")
-            .build()
-            .map_err(|_| "d3d12screencapturesrc requires the d3d12download element, which is unavailable".to_string())?;
-        pipeline.add(&d3d12download).map_err(|_| "Failed to add d3d12download to pipeline".to_string())?;
-        gst::Element::link_many(&[&src, &d3d12download, &videoconvert, &videoscale, &capsfilter, &videoenc, &h264_capsfilter, &rtph264pay])
-            .map_err(|e| format!("Failed to link video elements with d3d12download: {:?}", e))?;
-    } else {
-        // Fallback (videotestsrc, dx9screencapsrc): system-memory chain.
-        pipeline.add_many(&[&videoconvert, &videoscale, &capsfilter])
-            .map_err(|_| "Failed to add convert/scale/capsfilter to pipeline".to_string())?;
-        gst::Element::link_many(&[&src, &videoconvert, &videoscale, &capsfilter, &videoenc, &h264_capsfilter, &rtph264pay])
-            .map_err(|e| format!("Failed to link video elements: {:?}", e))?;
-    }
+    link_video_chain(&pipeline, &src, &videoconvert, &videoscale, &capsfilter, &videoenc, &h264_capsfilter, &rtph264pay)?;
 
     // Add probe to rtph264pay source pad for debugging
     if let Some(src_pad) = rtph264pay.static_pad("src") {

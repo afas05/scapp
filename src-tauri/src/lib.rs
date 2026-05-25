@@ -1,16 +1,14 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod gstreamer;
-#[cfg(windows)]
 mod windows_capture;
+#[cfg(target_os = "linux")]
+mod linux_capture;
 
 #[tauri::command]
 async fn list_windows() -> Result<Vec<windows_capture::WindowInfo>, String> {
-    #[cfg(windows)]
-    return tauri::async_runtime::spawn_blocking(|| windows_capture::enumerate_windows())
+    tauri::async_runtime::spawn_blocking(|| windows_capture::enumerate_windows())
         .await
-        .map_err(|e| format!("Task join error: {}", e))?;
-    #[cfg(not(windows))]
-    Err("Only supported on Windows".to_string())
+        .map_err(|e| format!("Task join error: {}", e))?
 }
 
 #[tauri::command]
@@ -79,24 +77,19 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .setup(|app| {
-            use tauri::Manager;
+        .setup(|_app| {
+            #[cfg(windows)]
+            {
+                use tauri::Manager;
 
-            // Runtime DLLs (gstreamer-1.0-0.dll & deps) are bundled directly
-            // next to the EXE — that's the only place Windows' loader looks
-            // at process startup. Plugins go in `gstreamer-1.0/` and we point
-            // GST_PLUGIN_PATH at that folder. See build.rs and tauri.conf.json
-            // `resources` map for the wiring.
-            let resource_dir = app.path().resource_dir()
-                .expect("Failed to resolve resource directory");
-            let gst_plugin_path = resource_dir.join("gstreamer-1.0");
-            std::env::set_var("GST_PLUGIN_PATH", &gst_plugin_path);
-
-            // Prevent GStreamer from scanning the host machine's system plugin dirs
-            std::env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", "");
-            std::env::set_var("GST_PLUGIN_SYSTEM_PATH", "");
-
-            println!("[setup] GST_PLUGIN_PATH = {}", gst_plugin_path.display());
+                let resource_dir = _app.path().resource_dir()
+                    .expect("Failed to resolve resource directory");
+                let gst_plugin_path = resource_dir.join("gstreamer-1.0");
+                std::env::set_var("GST_PLUGIN_PATH", &gst_plugin_path);
+                std::env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", "");
+                std::env::set_var("GST_PLUGIN_SYSTEM_PATH", "");
+                println!("[setup] GST_PLUGIN_PATH = {}", gst_plugin_path.display());
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![start_stream, stop_stream, list_windows, list_audio_inputs, set_mic_muted])
