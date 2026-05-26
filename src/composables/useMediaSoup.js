@@ -62,7 +62,7 @@ export function useMediaSoup() {
         });
     }
 
-    async function startSharing(windowHandle = null, processPid = null, micEnabled = false, micDeviceId = null) {
+    async function startSharing(windowHandle = null, processPid = null, micEnabled = false, micDeviceId = null, monitorIndex = null) {
         // 1a. Video PlainTransport (comedia=true; we just send RTP at it).
         const videoPt = await rpc.request(
             Method.CreateProducerPlainTransport,
@@ -152,6 +152,7 @@ export function useMediaSoup() {
             audioRtcpPort: audioPt.rtcpPort(),
             windowHandle: windowHandle ?? null,
             processPid: processPid ?? null,
+            monitorIndex: monitorIndex ?? null,
             micEnabled: !!micEnabled,
             micDeviceId: micEnabled ? (micDeviceId ?? null) : null,
             micInitiallyMuted: !micEnabled,

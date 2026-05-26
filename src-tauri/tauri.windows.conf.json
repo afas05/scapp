@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "resources": {
+      "gstreamer/bin/*.dll": "./",
+      "gstreamer/plugins/*.dll": "gstreamer-1.0/"
+    }
+  }
+}

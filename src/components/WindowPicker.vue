@@ -10,24 +10,40 @@ interface WindowInfo {
   thumbnail: string;
 }
 
+interface MonitorInfo {
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  thumbnail: string;
+}
+
 const props = defineProps<{ modelValue: boolean }>();
 const emit = defineEmits<{
   'update:modelValue': [value: boolean];
-  selected: [payload: { windowHandle: number; processPid: number }];
+  selected: [payload: { windowHandle: number; processPid: number; monitorIndex?: number }];
 }>();
 
 const windows = ref<WindowInfo[]>([]);
+const monitors = ref<MonitorInfo[]>([]);
 const loading = ref(false);
 const error = ref('');
-const hoveredId = ref<number | null>(null);
+const hoveredId = ref<string | null>(null);
 
 watch(() => props.modelValue, async (open) => {
   if (!open) return;
   loading.value = true;
   error.value = '';
   windows.value = [];
+  monitors.value = [];
   try {
-    windows.value = await invoke<WindowInfo[]>('list_windows');
+    const [wins, mons] = await Promise.all([
+      invoke<WindowInfo[]>('list_windows'),
+      invoke<MonitorInfo[]>('list_monitors').catch(() => [] as MonitorInfo[]),
+    ]);
+    windows.value = wins;
+    monitors.value = mons;
   } catch (e: any) {
     error.value = e?.message ?? String(e);
   } finally {
@@ -44,8 +60,8 @@ function select(win: WindowInfo) {
   close();
 }
 
-function selectScreen() {
-  emit('selected', { windowHandle: 0, processPid: 0 });
+function selectMonitor(index: number) {
+  emit('selected', { windowHandle: 0, processPid: 0, monitorIndex: index });
   close();
 }
 </script>
@@ -70,29 +86,37 @@ function selectScreen() {
 
         <div v-else class="picker-grid">
           <div
+            v-for="(mon, idx) in monitors"
+            :key="'mon-' + idx"
             class="window-card"
-            :class="{ hovered: hoveredId === 0 }"
-            @mouseenter="hoveredId = 0"
+            :class="{ hovered: hoveredId === 'mon-' + idx }"
+            @mouseenter="hoveredId = 'mon-' + idx"
             @mouseleave="hoveredId = null"
           >
             <div class="thumbnail-wrapper">
-              <div class="thumbnail-placeholder screen-tile">
+              <img
+                v-if="mon.thumbnail"
+                :src="`data:image/jpeg;base64,${mon.thumbnail}`"
+                :alt="mon.name"
+                class="thumbnail-img"
+              />
+              <div v-else class="thumbnail-placeholder screen-tile">
                 <span class="screen-icon">🖥</span>
-                <span>Entire Screen</span>
+                <span>{{ monitors.length === 1 ? 'Entire Screen' : mon.name }}</span>
               </div>
-              <div v-show="hoveredId === 0" class="hover-overlay">
-                <button class="select-btn" @click="selectScreen">Select</button>
+              <div v-show="hoveredId === 'mon-' + idx" class="hover-overlay">
+                <button class="select-btn" @click="selectMonitor(idx)">Select</button>
               </div>
             </div>
-            <p class="window-title">Entire Screen</p>
-            <p class="window-process">Primary monitor</p>
+            <p class="window-title">{{ monitors.length === 1 ? 'Entire Screen' : mon.name }}</p>
+            <p class="window-process">{{ mon.width }}×{{ mon.height }}</p>
           </div>
           <div
             v-for="win in windows"
             :key="win.id"
             class="window-card"
-            :class="{ hovered: hoveredId === win.id }"
-            @mouseenter="hoveredId = win.id"
+            :class="{ hovered: hoveredId === 'win-' + win.id }"
+            @mouseenter="hoveredId = 'win-' + win.id"
             @mouseleave="hoveredId = null"
           >
             <div class="thumbnail-wrapper">
@@ -105,7 +129,7 @@ function selectScreen() {
               <div v-else class="thumbnail-placeholder">
                 <span>No preview</span>
               </div>
-              <div v-show="hoveredId === win.id" class="hover-overlay">
+              <div v-show="hoveredId === 'win-' + win.id" class="hover-overlay">
                 <button class="select-btn" @click="select(win)">Select</button>
               </div>
             </div>

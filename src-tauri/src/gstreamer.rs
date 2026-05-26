@@ -335,6 +335,12 @@ fn configure_encoder(enc: &gst::Element) {
 // --- Platform-specific video source creation ---
 
 #[cfg(target_os = "linux")]
+fn is_wayland() -> bool {
+    std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
+        || std::env::var("XDG_SESSION_TYPE").map(|v| v == "wayland").unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
 fn create_video_source(window_handle: Option<u64>) -> Result<gst::Element, String> {
     let use_window_capture = window_handle.filter(|&h| h != 0).is_some();
 
@@ -345,10 +351,16 @@ fn create_video_source(window_handle: Option<u64>) -> Result<gst::Element, Strin
         return Err("ximagesrc unavailable — required for X11 window capture".to_string());
     }
 
-    if let Ok(el) = gst::ElementFactory::make("pipewiresrc").name("screensrc").build() {
-        return Ok(el);
+    if is_wayland() {
+        println!("[GStreamer] Wayland session detected, using pipewiresrc");
+        if let Ok(el) = gst::ElementFactory::make("pipewiresrc").name("screensrc").build() {
+            return Ok(el);
+        }
+        println!("[GStreamer] pipewiresrc not available, trying ximagesrc...");
+    } else {
+        println!("[GStreamer] X11 session detected, using ximagesrc");
     }
-    println!("[GStreamer] pipewiresrc not available, trying ximagesrc...");
+
     if let Ok(el) = gst::ElementFactory::make("ximagesrc").name("screensrc").build() {
         return Ok(el);
     }
@@ -406,13 +418,26 @@ fn create_video_source(window_handle: Option<u64>) -> Result<gst::Element, Strin
 // --- Platform-specific video source configuration ---
 
 #[cfg(target_os = "linux")]
-fn configure_video_source(src: &gst::Element, window_handle: Option<u64>) {
+fn configure_video_source(src: &gst::Element, window_handle: Option<u64>, monitor_index: Option<u32>) {
     let factory = src.factory().unwrap().name();
     if factory == "ximagesrc" {
         src.set_property("use-damage", false);
         src.set_property("show-pointer", true);
         if let Some(xid) = window_handle.filter(|&h| h != 0) {
             src.set_property("xid", xid);
+        } else if let Some(idx) = monitor_index {
+            if let Ok(monitors) = crate::windows_capture::enumerate_monitors() {
+                if let Some(mon) = monitors.get(idx as usize) {
+                    src.set_property("startx", mon.x as u32);
+                    src.set_property("starty", mon.y as u32);
+                    src.set_property("endx", (mon.x + mon.width as i32 - 1) as u32);
+                    src.set_property("endy", (mon.y + mon.height as i32 - 1) as u32);
+                    println!(
+                        "[GStreamer] ximagesrc region: {}x{} at ({},{})",
+                        mon.width, mon.height, mon.x, mon.y
+                    );
+                }
+            }
         }
     } else if factory == "videotestsrc" {
         src.set_property_from_str("pattern", "smpte");
@@ -422,8 +447,9 @@ fn configure_video_source(src: &gst::Element, window_handle: Option<u64>) {
 }
 
 #[cfg(windows)]
-fn configure_video_source(src: &gst::Element, window_handle: Option<u64>) {
+fn configure_video_source(src: &gst::Element, window_handle: Option<u64>, monitor_index: Option<u32>) {
     let src_factory = src.factory().unwrap().name();
+    let mon_idx = monitor_index.map(|i| i as i32).unwrap_or(0);
     if src_factory == "d3d11screencapturesrc" {
         src.set_property("show-cursor", &true);
         if let Some(hwnd) = window_handle.filter(|&h| h != 0) {
@@ -431,11 +457,11 @@ fn configure_video_source(src: &gst::Element, window_handle: Option<u64>) {
             src.set_property("window-handle", hwnd);
         } else {
             src.set_property_from_str("capture-api", "wgc");
-            src.set_property("monitor-index", &0i32);
+            src.set_property("monitor-index", &mon_idx);
         }
     } else if src_factory == "d3d12screencapturesrc" || src_factory == "dx9screencapsrc" {
         src.set_property("show-cursor", &true);
-        src.set_property("monitor-index", &0i32);
+        src.set_property("monitor-index", &mon_idx);
     } else if src_factory == "videotestsrc" {
         src.set_property_from_str("pattern", "smpte");
         src.set_property("is-live", true);
@@ -864,6 +890,7 @@ pub fn create_gstreamer_pipeline(
     audio_rtcp_port: u16,
     window_handle: Option<u64>,
     process_pid: Option<u32>,
+    monitor_index: Option<u32>,
     mic_enabled: bool,
     mic_device_id: Option<String>,
     mic_initially_muted: bool,
@@ -1217,7 +1244,7 @@ pub fn create_gstreamer_pipeline(
         Some(glib::Value::from(&bin))
     });
 
-    configure_video_source(&src, window_handle);
+    configure_video_source(&src, window_handle, monitor_index);
     configure_encoder(&videoenc);
 
     rtph264pay.set_property("ssrc", VIDEO_SSRC);
@@ -1667,6 +1694,7 @@ pub fn start_streaming(
     audio_rtcp_port: u16,
     window_handle: Option<u64>,
     process_pid: Option<u32>,
+    monitor_index: Option<u32>,
     mic_enabled: bool,
     mic_device_id: Option<String>,
     mic_initially_muted: bool,
@@ -1674,16 +1702,16 @@ pub fn start_streaming(
     init()?;
 
     println!(
-        "video {}:{}/{}  audio {}:{}/{}  mic_enabled={} mic_device={:?} mic_initially_muted={}",
+        "video {}:{}/{}  audio {}:{}/{}  monitor_index={:?} mic_enabled={} mic_device={:?} mic_initially_muted={}",
         video_host, video_rtp_port, video_rtcp_port,
         audio_host, audio_rtp_port, audio_rtcp_port,
-        mic_enabled, mic_device_id, mic_initially_muted,
+        monitor_index, mic_enabled, mic_device_id, mic_initially_muted,
     );
 
     create_gstreamer_pipeline(
         &video_host, video_rtp_port, video_rtcp_port,
         &audio_host, audio_rtp_port, audio_rtcp_port,
-        window_handle, process_pid,
+        window_handle, process_pid, monitor_index,
         mic_enabled, mic_device_id, mic_initially_muted,
     )?;
 

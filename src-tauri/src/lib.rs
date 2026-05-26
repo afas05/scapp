@@ -12,6 +12,13 @@ async fn list_windows() -> Result<Vec<windows_capture::WindowInfo>, String> {
 }
 
 #[tauri::command]
+async fn list_monitors() -> Result<Vec<windows_capture::MonitorInfo>, String> {
+    tauri::async_runtime::spawn_blocking(|| windows_capture::enumerate_monitors())
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+}
+
+#[tauri::command]
 async fn list_audio_inputs() -> Result<Vec<gstreamer::MicDevice>, String> {
     tauri::async_runtime::spawn_blocking(|| gstreamer::list_audio_input_devices())
         .await
@@ -28,6 +35,7 @@ async fn start_stream(
     audio_rtcp_port: u16,
     window_handle: Option<u64>,
     process_pid: Option<u32>,
+    monitor_index: Option<u32>,
     mic_enabled: Option<bool>,
     mic_device_id: Option<String>,
     mic_initially_muted: Option<bool>,
@@ -42,6 +50,7 @@ async fn start_stream(
             audio_rtcp_port,
             window_handle,
             process_pid,
+            monitor_index,
             mic_enabled.unwrap_or(false),
             mic_device_id,
             mic_initially_muted.unwrap_or(false),
@@ -92,7 +101,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![start_stream, stop_stream, list_windows, list_audio_inputs, set_mic_muted])
+        .invoke_handler(tauri::generate_handler![start_stream, stop_stream, list_windows, list_monitors, list_audio_inputs, set_mic_muted])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

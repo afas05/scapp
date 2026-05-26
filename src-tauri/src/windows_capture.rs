@@ -1,12 +1,22 @@
 use serde::Serialize;
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct WindowInfo {
     pub id: u64,
     pub pid: u32,
     pub title: String,
     pub process_name: String,
     pub thumbnail: String, // base64 JPEG, empty if capture fails
+}
+
+#[derive(Serialize, Clone)]
+pub struct MonitorInfo {
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub thumbnail: String,
 }
 
 pub fn enumerate_windows() -> Result<Vec<WindowInfo>, String> {
@@ -16,6 +26,15 @@ pub fn enumerate_windows() -> Result<Vec<WindowInfo>, String> {
     return crate::linux_capture::enumerate_windows();
     #[cfg(not(any(windows, target_os = "linux")))]
     Err("Window enumeration is not supported on this platform".to_string())
+}
+
+pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, String> {
+    #[cfg(windows)]
+    return win::enumerate_monitors();
+    #[cfg(target_os = "linux")]
+    return crate::linux_capture::enumerate_monitors();
+    #[cfg(not(any(windows, target_os = "linux")))]
+    Err("Monitor enumeration is not supported on this platform".to_string())
 }
 
 #[cfg(windows)]
@@ -291,6 +310,43 @@ mod win {
         }
 
         STANDARD.encode(&jpeg_bytes)
+    }
+
+    pub fn enumerate_monitors() -> Result<Vec<super::MonitorInfo>, String> {
+        use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HMONITOR};
+
+        unsafe extern "system" fn mon_cb(
+            _hmon: HMONITOR,
+            _hdc: windows::Win32::Graphics::Gdi::HDC,
+            lprect: *mut RECT,
+            lparam: LPARAM,
+        ) -> windows::Win32::Foundation::BOOL {
+            let monitors = &mut *(lparam.0 as *mut Vec<super::MonitorInfo>);
+            if let Some(rc) = lprect.as_ref() {
+                let idx = monitors.len();
+                monitors.push(super::MonitorInfo {
+                    name: format!("Monitor {}", idx + 1),
+                    x: rc.left,
+                    y: rc.top,
+                    width: (rc.right - rc.left) as u32,
+                    height: (rc.bottom - rc.top) as u32,
+                    thumbnail: String::new(),
+                });
+            }
+            windows::Win32::Foundation::BOOL(1)
+        }
+
+        let mut monitors: Vec<super::MonitorInfo> = Vec::new();
+        unsafe {
+            let _ = EnumDisplayMonitors(
+                None,
+                None,
+                Some(mon_cb),
+                LPARAM(&mut monitors as *mut Vec<super::MonitorInfo> as isize),
+            );
+        }
+        monitors.sort_by_key(|m| (m.x, m.y));
+        Ok(monitors)
     }
 
     pub fn enumerate() -> Result<Vec<WindowInfo>, String> {

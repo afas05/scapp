@@ -24,6 +24,15 @@ interface WindowInfo {
   thumbnail: string;
 }
 
+interface MonitorInfo {
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  thumbnail: string;
+}
+
 interface MicDevice {
   id: string;
   name: string;
@@ -56,12 +65,13 @@ const peakViewers = ref<number>(0);
 const updateStatus = ref<string>('');
 const updateBusy = ref<boolean>(false);
 
-const ENTIRE_SCREEN: IdleSource = {
+const FALLBACK_SCREEN: IdleSource = {
   id: 0,
   pid: 0,
   title: 'Entire Screen',
   processName: 'Primary monitor',
   kind: 'desktop',
+  monitorIndex: 0,
 };
 
 function kindFromProcess(name: string): IdleSource['kind'] {
@@ -86,7 +96,27 @@ async function loadMicDevices() {
   }
 }
 
+async function loadMonitorSources(): Promise<IdleSource[]> {
+  try {
+    const monitors = await invoke<MonitorInfo[]>('list_monitors');
+    if (monitors.length === 0) return [FALLBACK_SCREEN];
+    return monitors.map((m, i) => ({
+      id: -(i + 1),
+      pid: 0,
+      title: monitors.length === 1 ? 'Entire Screen' : `${m.name}`,
+      processName: `${m.width}×${m.height}`,
+      thumbnail: m.thumbnail || undefined,
+      kind: 'desktop' as const,
+      monitorIndex: i,
+    }));
+  } catch (e: any) {
+    console.warn('[Monitors] list_monitors failed:', e);
+    return [FALLBACK_SCREEN];
+  }
+}
+
 async function loadSources() {
+  const monitorSources = await loadMonitorSources();
   try {
     const list = await invoke<WindowInfo[]>('list_windows');
     const mapped: IdleSource[] = list.map(w => ({
@@ -97,13 +127,13 @@ async function loadSources() {
       thumbnail: w.thumbnail || undefined,
       kind: kindFromProcess(w.process_name),
     }));
-    sources.value = [ENTIRE_SCREEN, ...mapped];
+    sources.value = [...monitorSources, ...mapped];
     if (!sources.value.some(s => s.id === selectedId.value)) {
       selectedId.value = sources.value[0].id;
     }
   } catch (e: any) {
     console.warn('[Sources] list_windows failed:', e);
-    sources.value = [ENTIRE_SCREEN];
+    sources.value = monitorSources;
   }
 }
 
@@ -162,11 +192,13 @@ async function startStream() {
     const config = await loadConfig();
     console.log('[MediaSoup] Connecting to SFU:', config.sfuWsUrl);
     await mediaSoup.init(userStore.sessionHash, config);
+    const src = selectedSource.value;
     await mediaSoup.startSharing(
-      selectedSource.value.id,
-      selectedSource.value.pid,
+      src.monitorIndex !== undefined ? 0 : src.id,
+      src.pid,
       micOn.value,
       micDevice.value || null,
+      src.monitorIndex ?? null,
     );
   } catch (err: any) {
     console.error('[MediaSoup] Failed to start stream:', err);
@@ -203,12 +235,19 @@ function openStream() {
   }
 }
 
-async function onPickerSelected({ windowHandle }: { windowHandle: number; processPid: number }) {
-  // Make sure that pick is also represented in our source list. If not present, refresh.
-  if (!sources.value.some(s => s.id === windowHandle)) {
+async function onPickerSelected(payload: { windowHandle: number; processPid: number; monitorIndex?: number }) {
+  if (payload.monitorIndex !== undefined) {
+    const monitorId = -(payload.monitorIndex + 1);
+    if (!sources.value.some(s => s.id === monitorId)) {
+      await loadSources();
+    }
+    selectedId.value = monitorId;
+    return;
+  }
+  if (!sources.value.some(s => s.id === payload.windowHandle)) {
     await loadSources();
   }
-  selectedId.value = windowHandle;
+  selectedId.value = payload.windowHandle;
 }
 
 async function onLogout() {

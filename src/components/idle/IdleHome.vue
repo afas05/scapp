@@ -24,6 +24,7 @@ export interface IdleSource {
   processName: string;
   thumbnail?: string;
   kind?: 'game' | 'browser' | 'app' | 'desktop';
+  monitorIndex?: number;
 }
 
 export interface MicDevice {
