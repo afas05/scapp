@@ -122,8 +122,10 @@ jobs:
           releaseBody: 'See assets to download and install.'
           releaseDraft: true
           prerelease: false
+          includeUpdaterJson: false
 
   build-linux:
+    needs: build-windows
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -173,3 +175,15 @@ jobs:
           releaseBody: 'See assets to download and install.'
           releaseDraft: true
           prerelease: false
+
+  publish:
+    needs: build-linux
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false
