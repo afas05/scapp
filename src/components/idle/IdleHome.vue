@@ -46,7 +46,7 @@ const props = withDefaults(defineProps<{
   lastSession?: { duration: string; peakViewers: number } | null;
   updateStatus?: string;
 }>(), {
-  appVersion: 'v0.3.9',
+  appVersion: '',
   sfuLatencyMs: 28,
   micDevice: '',
   availableMics: () => [],
@@ -126,7 +126,6 @@ const quickSources = computed(() => props.sources.slice(0, 4));
           <ScreenPlaceholder
             v-if="selectedSource"
             :kind="selectedSource.kind"
-            :thumbnail="selectedSource.thumbnail"
             :label="selectedSource ? `${selectedSource.processName}` : ''"
           />
           <ScreenPlaceholder v-else kind="desktop" />

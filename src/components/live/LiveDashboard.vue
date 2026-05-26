@@ -22,11 +22,13 @@ const props = withDefaults(defineProps<{
   availableMics?: MicDevice[];
   viewerCount?: number;
   shareUrl?: string;
+  previewFrame?: string;
 }>(), {
   micDevice: '',
   availableMics: () => [],
   viewerCount: 0,
   shareUrl: 'streamsnipe.live',
+  previewFrame: '',
 });
 
 const emit = defineEmits<{
@@ -169,7 +171,7 @@ const trendTone = computed<'up' | 'down'>(() => (trend.value >= 0 ? 'up' : 'down
       <ScreenPlaceholder
         v-if="selectedSource"
         :kind="selectedSource.kind"
-        :thumbnail="selectedSource.thumbnail"
+        :thumbnail="previewFrame || selectedSource.thumbnail"
       />
       <ScreenPlaceholder v-else kind="desktop" />
 
@@ -332,8 +334,8 @@ const trendTone = computed<'up' | 'down'>(() => (trend.value >= 0 ? 'up' : 'down
 
 .preview {
   position: relative;
-  flex: 0 0 auto;
-  height: 232px;
+  flex: 1 1 0;
+  min-height: 120px;
   background: #000;
   overflow: hidden;
   border-bottom: 1px solid var(--border-soft);
@@ -384,8 +386,7 @@ const trendTone = computed<'up' | 'down'>(() => (trend.value >= 0 ? 'up' : 'down
   box-shadow: 0 8px 24px rgba(0,0,0,0.5);
 }
 .lower {
-  flex: 1;
-  min-height: 0;
+  flex: 0 0 auto;
   padding: 10px 14px;
   display: grid;
   grid-template-columns: 1fr 220px;

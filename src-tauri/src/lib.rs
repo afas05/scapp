@@ -26,6 +26,11 @@ async fn list_audio_inputs() -> Result<Vec<gstreamer::MicDevice>, String> {
 }
 
 #[tauri::command]
+async fn get_preview_frame() -> Result<String, String> {
+    gstreamer::get_preview_frame()
+}
+
+#[tauri::command]
 async fn start_stream(
     video_host: String,
     video_rtp_port: u16,
@@ -101,7 +106,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![start_stream, stop_stream, list_windows, list_monitors, list_audio_inputs, set_mic_muted])
+        .invoke_handler(tauri::generate_handler![start_stream, stop_stream, list_windows, list_monitors, list_audio_inputs, set_mic_muted, get_preview_frame])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

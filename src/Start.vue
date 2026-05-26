@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, computed } from 'vue';
+import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue';
 import { open } from '@tauri-apps/plugin-shell';
 import { invoke } from '@tauri-apps/api/core';
+import { getVersion } from '@tauri-apps/api/app';
 import { check } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { useRouter } from 'vue-router';
@@ -64,6 +65,39 @@ const streamStartedAt = ref<number>(0);
 const peakViewers = ref<number>(0);
 const updateStatus = ref<string>('');
 const updateBusy = ref<boolean>(false);
+const appVersion = ref<string>('');
+
+const previewFrame = ref<string>('');
+let previewTimer: number | null = null;
+let previewBusy = false;
+
+async function refreshPreview() {
+  if (previewBusy) return;
+  previewBusy = true;
+  try {
+    const frame = await invoke<string>('get_preview_frame');
+    if (frame) previewFrame.value = frame;
+  } catch {}
+  previewBusy = false;
+}
+
+function startPreviewTimer() {
+  stopPreviewTimer();
+  previewTimer = window.setInterval(refreshPreview, 66);
+}
+
+function stopPreviewTimer() {
+  if (previewTimer != null) {
+    clearInterval(previewTimer);
+    previewTimer = null;
+  }
+  previewFrame.value = '';
+}
+
+watch(phase, (p) => {
+  if (p === 'live') startPreviewTimer();
+  else stopPreviewTimer();
+});
 
 const FALLBACK_SCREEN: IdleSource = {
   id: 0,
@@ -284,9 +318,11 @@ async function checkForUpdate() {
 onMounted(() => {
   loadSources();
   loadMicDevices();
+  getVersion().then(v => { appVersion.value = `v${v}`; }).catch(() => {});
 });
 
 onBeforeUnmount(() => {
+  stopPreviewTimer();
   if (phase.value === 'live' || phase.value === 'connecting') {
     mediaSoup.destroy().catch(() => {});
   }
@@ -299,6 +335,7 @@ onBeforeUnmount(() => {
 
     <IdleHome
       v-if="phase === 'idle'"
+      :app-version="appVersion"
       :sources="sources"
       :selected-id="selectedId"
       :camera-on="cameraOn"
@@ -329,6 +366,7 @@ onBeforeUnmount(() => {
       :available-mics="availableMics"
       :viewer-count="viewerCount"
       :share-url="shareUrl"
+      :preview-frame="previewFrame"
       @select="id => (selectedId = id)"
       @toggle-camera="cameraOn = !cameraOn"
       @toggle-mic="onLiveToggleMic"

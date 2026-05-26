@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use glib::ObjectExt;
 use glib::Cast;
 use gstreamer::prelude::{DeviceExt, DeviceMonitorExt, DeviceMonitorExtManual, ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual, GstObjectExt, PadExt, PadExtManual};
+use base64::{engine::general_purpose::STANDARD, Engine};
 
 // Diagnostic counters incremented by pad probes; the stats thread reads and
 // resets them once per second to compute per-stage rates.
@@ -242,6 +243,11 @@ impl GstreamerState {
 lazy_static::lazy_static! {
     static ref STATE: Arc<Mutex<GstreamerState>> = Arc::new(Mutex::new(GstreamerState::new()));
     static ref GSTREAMER_INITIALIZED: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    static ref PREVIEW_FRAME: Mutex<String> = Mutex::new(String::new());
+}
+
+pub fn get_preview_frame() -> Result<String, String> {
+    Ok(PREVIEW_FRAME.lock().unwrap().clone())
 }
 
 // Initialize GStreamer (can only be called once per process)
@@ -611,7 +617,8 @@ fn create_mic_source(dev_id: &str) -> Result<gst::Element, String> {
 #[cfg(target_os = "linux")]
 fn link_video_chain(
     pipeline: &gst::Pipeline,
-    src: &gst::Element,
+    _src_factory_name: &str,
+    chain_start: &gst::Element,
     videoconvert: &gst::Element,
     videoscale: &gst::Element,
     capsfilter: &gst::Element,
@@ -621,14 +628,15 @@ fn link_video_chain(
 ) -> Result<(), String> {
     pipeline.add_many(&[videoconvert, videoscale, capsfilter])
         .map_err(|_| "Failed to add convert/scale/capsfilter to pipeline".to_string())?;
-    gst::Element::link_many(&[src, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter, rtph264pay])
+    gst::Element::link_many(&[chain_start, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter, rtph264pay])
         .map_err(|e| format!("Failed to link video elements: {:?}", e))
 }
 
 #[cfg(windows)]
 fn link_video_chain(
     pipeline: &gst::Pipeline,
-    src: &gst::Element,
+    src_factory_name: &str,
+    chain_start: &gst::Element,
     videoconvert: &gst::Element,
     videoscale: &gst::Element,
     capsfilter: &gst::Element,
@@ -636,8 +644,7 @@ fn link_video_chain(
     h264_capsfilter: &gst::Element,
     rtph264pay: &gst::Element,
 ) -> Result<(), String> {
-    let src_factory = src.factory().unwrap().name();
-    if src_factory == "d3d11screencapturesrc" {
+    if src_factory_name == "d3d11screencapturesrc" {
         let d3d11convert = gst::ElementFactory::make("d3d11convert")
             .name("d3d11convert")
             .build()
@@ -656,21 +663,21 @@ fn link_video_chain(
         d3d11_capsfilter.set_property("caps", &d3d11_caps);
         pipeline.add_many(&[&d3d11convert, &d3d11_capsfilter])
             .map_err(|_| "Failed to add d3d11 zero-copy elements to pipeline".to_string())?;
-        gst::Element::link_many(&[src, &d3d11convert, &d3d11_capsfilter, videoenc, h264_capsfilter, rtph264pay])
+        gst::Element::link_many(&[chain_start, &d3d11convert, &d3d11_capsfilter, videoenc, h264_capsfilter, rtph264pay])
             .map_err(|e| format!("Failed to link d3d11 zero-copy chain: {:?}", e))
-    } else if src_factory == "d3d12screencapturesrc" {
+    } else if src_factory_name == "d3d12screencapturesrc" {
         pipeline.add_many(&[videoconvert, videoscale, capsfilter])
             .map_err(|_| "Failed to add convert/scale/capsfilter to pipeline".to_string())?;
         let d3d12download = gst::ElementFactory::make("d3d12download")
             .build()
             .map_err(|_| "d3d12screencapturesrc requires the d3d12download element".to_string())?;
         pipeline.add(&d3d12download).map_err(|_| "Failed to add d3d12download to pipeline".to_string())?;
-        gst::Element::link_many(&[src, &d3d12download, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter, rtph264pay])
+        gst::Element::link_many(&[chain_start, &d3d12download, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter, rtph264pay])
             .map_err(|e| format!("Failed to link video elements with d3d12download: {:?}", e))
     } else {
         pipeline.add_many(&[videoconvert, videoscale, capsfilter])
             .map_err(|_| "Failed to add convert/scale/capsfilter to pipeline".to_string())?;
-        gst::Element::link_many(&[src, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter, rtph264pay])
+        gst::Element::link_many(&[chain_start, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter, rtph264pay])
             .map_err(|e| format!("Failed to link video elements: {:?}", e))
     }
 }
@@ -878,6 +885,100 @@ fn bus_call(_bus: &gst::Bus, msg: &gst::Message) -> glib::ControlFlow {
         }
         _ => glib::ControlFlow::Continue,
     }
+}
+
+fn build_preview_branch(
+    pipeline: &gst::Pipeline,
+    tee: &gst::Element,
+    src_factory_name: &str,
+) {
+    let make = |factory: &str, name: &str| -> Option<gst::Element> {
+        gst::ElementFactory::make(factory).name(name).build().ok()
+    };
+
+    let queue = match make("queue", "preview_queue") {
+        Some(q) => q,
+        None => { eprintln!("[Preview] queue unavailable, skipping preview"); return; }
+    };
+    queue.set_property_from_str("leaky", "downstream");
+    queue.set_property("max-size-buffers", 2u32);
+    queue.set_property("max-size-time", 0u64);
+    queue.set_property("max-size-bytes", 0u32);
+
+    let download: Option<gst::Element> = match src_factory_name {
+        "d3d11screencapturesrc" => make("d3d11download", "preview_download"),
+        "d3d12screencapturesrc" => make("d3d12download", "preview_download"),
+        _ => None,
+    };
+
+    let videoconvert = match make("videoconvert", "preview_videoconvert") {
+        Some(v) => v,
+        None => { eprintln!("[Preview] videoconvert unavailable, skipping preview"); return; }
+    };
+    let videoscale = match make("videoscale", "preview_videoscale") {
+        Some(v) => v,
+        None => { eprintln!("[Preview] videoscale unavailable, skipping preview"); return; }
+    };
+    let videorate = match make("videorate", "preview_videorate") {
+        Some(v) => v,
+        None => { eprintln!("[Preview] videorate unavailable, skipping preview"); return; }
+    };
+    let capsfilter = match make("capsfilter", "preview_capsfilter") {
+        Some(c) => c,
+        None => { eprintln!("[Preview] capsfilter unavailable, skipping preview"); return; }
+    };
+    let jpegenc = match make("jpegenc", "preview_jpegenc") {
+        Some(j) => j,
+        None => { eprintln!("[Preview] jpegenc unavailable, skipping preview"); return; }
+    };
+    let fakesink = match make("fakesink", "preview_fakesink") {
+        Some(f) => f,
+        None => { eprintln!("[Preview] fakesink unavailable, skipping preview"); return; }
+    };
+
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("width", 1920i32)
+        .field("height", 1080i32)
+        .field("framerate", gst::Fraction::new(15, 1))
+        .build();
+    capsfilter.set_property("caps", &caps);
+    jpegenc.set_property("quality", 90i32);
+    fakesink.set_property("sync", false);
+
+    if let Some(pad) = jpegenc.static_pad("src") {
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+            if let Some(buffer) = info.buffer() {
+                if let Ok(map) = buffer.map_readable() {
+                    let b64 = STANDARD.encode(map.as_slice());
+                    *PREVIEW_FRAME.lock().unwrap() = b64;
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+
+    let mut elements: Vec<&gst::Element> = vec![&queue];
+    if let Some(ref dl) = download {
+        elements.push(dl);
+    }
+    elements.extend_from_slice(&[&videoconvert, &videoscale, &videorate, &capsfilter, &jpegenc, &fakesink]);
+
+    if pipeline.add_many(&elements.iter().copied().collect::<Vec<_>>()).is_err() {
+        eprintln!("[Preview] Failed to add preview elements to pipeline, skipping");
+        return;
+    }
+
+    if gst::Element::link_many(&elements).is_err() {
+        eprintln!("[Preview] Failed to link preview chain, skipping");
+        return;
+    }
+
+    if tee.link(&queue).is_err() {
+        eprintln!("[Preview] Failed to link tee → preview queue, skipping");
+        return;
+    }
+
+    println!("[Preview] Preview branch attached ({} → 1920x1080 @15fps JPEG q90)", src_factory_name);
 }
 
 // Create and start the GStreamer pipeline
@@ -1304,18 +1405,24 @@ pub fn create_gstreamer_pipeline(
         ("buffer-size", &262_144i32),
     ]);
 
+    // Tee splits the capture source into the main encode/RTP path and a
+    // lightweight preview branch that feeds JPEG snapshots to the frontend.
+    let tee = gst::ElementFactory::make("tee")
+        .name("video_tee")
+        .build()
+        .map_err(|_| "Failed to create tee element".to_string())?;
+    let queue_main = gst::ElementFactory::make("queue")
+        .name("queue_main")
+        .build()
+        .map_err(|_| "Failed to create queue_main element".to_string())?;
+
     // Add elements to pipeline. Audio is always wired up here; if the WASAPI
     // device fails to open at runtime, the bus error handler tears down the
     // audio sub-graph at runtime (see `disable_audio_chain`) so the video
     // chain isn't blocked by an element stuck in ERROR state propagating
     // through the shared rtpbin.
-    // Elements that are always in the pipeline regardless of source branch.
-    // `videoconvert`/`videoscale`/`capsfilter` are only added for the
-    // system-memory branches below — the d3d11 zero-copy path doesn't use
-    // them, and including an orphan element in `add_many` will block the
-    // pipeline state transition.
     pipeline.add_many(&[
-        &rtpbin, &src,
+        &rtpbin, &src, &tee, &queue_main,
         &videoenc, &h264_capsfilter, &rtph264pay, &rtp_sink,
         &rtcp_sink, &rtcp_src,
         &audio_src, &audioconvert, &audioresample, &sys_audio_caps, &opus_capsfilter,
@@ -1330,7 +1437,14 @@ pub fn create_gstreamer_pipeline(
         pipeline.add(mixer).map_err(|_| "Failed to add audiomixer to pipeline".to_string())?;
     }
 
-    link_video_chain(&pipeline, &src, &videoconvert, &videoscale, &capsfilter, &videoenc, &h264_capsfilter, &rtph264pay)?;
+    gst::Element::link_many(&[&src, &tee])
+        .map_err(|e| format!("Failed to link src → tee: {:?}", e))?;
+    tee.link(&queue_main)
+        .map_err(|e| format!("Failed to link tee → queue_main: {:?}", e))?;
+
+    link_video_chain(&pipeline, &src_factory_name, &queue_main, &videoconvert, &videoscale, &capsfilter, &videoenc, &h264_capsfilter, &rtph264pay)?;
+
+    build_preview_branch(&pipeline, &tee, &src_factory_name);
 
     // Add probe to rtph264pay source pad for debugging
     if let Some(src_pad) = rtph264pay.static_pad("src") {
@@ -1682,6 +1796,8 @@ pub fn cleanup() {
             main_loop.quit();
         }
     }
+
+    *PREVIEW_FRAME.lock().unwrap() = String::new();
 }
 
 // Start streaming function to be called from lib.rs

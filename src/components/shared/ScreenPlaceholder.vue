@@ -22,8 +22,10 @@ const bgStyle = computed(() => {
   if (props.thumbnail) {
     return {
       backgroundImage: `url(data:image/jpeg;base64,${props.thumbnail})`,
-      backgroundSize: 'cover',
+      backgroundSize: 'contain',
       backgroundPosition: 'center',
+      backgroundRepeat: 'no-repeat',
+      backgroundColor: '#000',
     };
   }
   return { background: gradients[props.kind] || gradients.game };

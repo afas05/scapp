@@ -37,6 +37,7 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, String> {
     Err("Monitor enumeration is not supported on this platform".to_string())
 }
 
+
 #[cfg(windows)]
 mod win {
     use super::WindowInfo;
