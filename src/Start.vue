@@ -12,10 +12,14 @@ import { useMediaSoup } from './composables/useMediaSoup.js';
 // @ts-ignore — JS module, no .d.ts
 import { loadConfig } from './config.js';
 
+import { openPath } from '@tauri-apps/plugin-opener';
+import { join as pathJoin } from '@tauri-apps/api/path';
 import IdleHome, { type IdleSource } from './components/idle/IdleHome.vue';
 import LiveDashboard from './components/live/LiveDashboard.vue';
 import Connecting from './components/shared/Connecting.vue';
 import WindowPicker from './components/WindowPicker.vue';
+import SettingsModal from './components/shared/SettingsModal.vue';
+import { useSettingsStore } from './stores/settingsStore';
 
 interface WindowInfo {
   id: number;
@@ -49,7 +53,7 @@ const phase = ref<Phase>('idle');
 
 const sources = ref<IdleSource[]>([]);
 const selectedId = ref<number>(0);
-const cameraOn = ref<boolean>(true);
+const cameraOn = ref<boolean>(false);
 const micOn = ref<boolean>(true);
 const availableMics = ref<MicDevice[]>([]);
 const micDevice = ref<string>('');
@@ -60,6 +64,8 @@ const userSession = ref<string>('');
 const viewerCount = ref<number>(0);
 const errorMessage = ref<string>('');
 const showPicker = ref<boolean>(false);
+const showSettings = ref<boolean>(false);
+const settingsStore = useSettingsStore();
 const lastSession = ref<{ duration: string; peakViewers: number } | null>(null);
 const streamStartedAt = ref<number>(0);
 const peakViewers = ref<number>(0);
@@ -269,6 +275,44 @@ function openStream() {
   }
 }
 
+async function openRecordingsFolder() {
+  const path = settingsStore.recordingPath;
+  if (path) {
+    try {
+      await openPath(path);
+    } catch (err) {
+      console.warn('[Recordings] Failed to open folder:', err);
+    }
+  }
+}
+
+async function onStartRecording() {
+  const dir = settingsStore.recordingPath;
+  if (!dir) {
+    console.warn('[Recording] No recording path configured');
+    return;
+  }
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+  const filename = `recording_${timestamp}.mp4`;
+  const filePath = await pathJoin(dir, filename);
+  try {
+    await invoke('start_recording', { path: filePath });
+    console.log('[Recording] Started:', filePath);
+  } catch (err: any) {
+    console.error('[Recording] Failed to start:', err);
+    errorMessage.value = `Recording failed: ${err?.message ?? err}`;
+  }
+}
+
+async function onStopRecording() {
+  try {
+    await invoke('stop_recording');
+    console.log('[Recording] Stopped');
+  } catch (err: any) {
+    console.error('[Recording] Failed to stop:', err);
+  }
+}
+
 async function onPickerSelected(payload: { windowHandle: number; processPid: number; monitorIndex?: number }) {
   if (payload.monitorIndex !== undefined) {
     const monitorId = -(payload.monitorIndex + 1);
@@ -347,13 +391,13 @@ onBeforeUnmount(() => {
       :update-status="updateStatus"
       @select="id => (selectedId = id)"
       @open-picker="showPicker = true"
-      @toggle-camera="cameraOn = !cameraOn"
       @toggle-mic="micOn = !micOn"
       @pick-mic="v => (micDevice = v)"
-      @pick-cam="v => (camDevice = v)"
       @start="startStream"
       @logout="onLogout"
       @check-update="checkForUpdate"
+      @open-settings="showSettings = true"
+      @open-recordings="openRecordingsFolder"
     />
 
     <LiveDashboard
@@ -368,14 +412,17 @@ onBeforeUnmount(() => {
       :share-url="shareUrl"
       :preview-frame="previewFrame"
       @select="id => (selectedId = id)"
-      @toggle-camera="cameraOn = !cameraOn"
       @toggle-mic="onLiveToggleMic"
       @stop="stopStream"
+      @open-settings="showSettings = true"
+      @start-recording="onStartRecording"
+      @stop-recording="onStopRecording"
     />
 
     <Connecting v-if="phase === 'connecting'" />
 
     <WindowPicker v-model="showPicker" @selected="onPickerSelected" />
+    <SettingsModal v-model="showSettings" />
 
     <a
       v-if="phase === 'live' && producerId"

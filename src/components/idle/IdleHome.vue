@@ -10,13 +10,6 @@ import SourceCard from './SourceCard.vue';
 import DeviceSelect from './DeviceSelect.vue';
 import { useMicLevel } from '../../composables/useMicLevel';
 
-const CAM_DEVICES = [
-  'Logitech C920',
-  'Integrated Webcam',
-  'OBS Virtual Camera',
-  'iPhone Continuity Camera',
-];
-
 export interface IdleSource {
   id: number;
   pid: number;
@@ -65,6 +58,8 @@ const emit = defineEmits<{
   pickCam: [device: string];
   logout: [];
   checkUpdate: [];
+  openSettings: [];
+  openRecordings: [];
 }>();
 
 const selectedMic = computed(() =>
@@ -139,10 +134,6 @@ const quickSources = computed(() => props.sources.slice(0, 4));
             Change source
           </button>
 
-          <div v-if="cameraOn" class="cam-pip">
-            <CamPlaceholder :on="true" />
-          </div>
-
           <div v-if="selectedSource" class="src-title">{{ selectedSource.title }}</div>
         </div>
 
@@ -168,25 +159,20 @@ const quickSources = computed(() => props.sources.slice(0, 4));
             </div>
           </SetupRow>
 
-          <SetupRow
-            icon="cam"
-            label="Webcam"
-            :on="cameraOn"
-            toggleable
-            @toggle="emit('toggleCamera')"
-          >
-            <template #value>
-              <DeviceSelect
-                :value="camDevice ?? ''"
-                :options="CAM_DEVICES"
-                :disabled="!cameraOn"
-                @change="v => emit('pickCam', v)"
-              />
-            </template>
-            <div class="cam-tile">
-              <CamPlaceholder :on="cameraOn" />
-            </div>
-          </SetupRow>
+          <div class="disabled-feature">
+            <SetupRow
+              icon="cam"
+              label="Webcam"
+              :on="false"
+            >
+              <template #value>
+                <span class="coming-soon">Coming soon</span>
+              </template>
+              <div class="cam-tile">
+                <CamPlaceholder :on="false" />
+              </div>
+            </SetupRow>
+          </div>
 
           <SetupRow
             icon="audio"
@@ -232,8 +218,8 @@ const quickSources = computed(() => props.sources.slice(0, 4));
         <span v-if="updateStatus" class="last">{{ updateStatus }}</span>
       </div>
       <div class="foot-right">
-        <span class="foot-link"><Icon name="cog" :size="10" /> Settings</span>
-        <span class="foot-link"><Icon name="folder" :size="10" /> Recordings</span>
+        <span class="foot-link" @click="emit('openSettings')"><Icon name="cog" :size="10" /> Settings</span>
+        <span class="foot-link" @click="emit('openRecordings')"><Icon name="folder" :size="10" /> Recordings</span>
         <span class="foot-link" @click="emit('checkUpdate')">
           <Icon name="refresh" :size="10" />
           Check for updates
@@ -352,17 +338,6 @@ const quickSources = computed(() => props.sources.slice(0, 4));
   text-transform: none;
   cursor: pointer;
 }
-.cam-pip {
-  position: absolute;
-  right: 12px;
-  bottom: 12px;
-  width: 24%;
-  aspect-ratio: 4/3;
-  border-radius: 6px;
-  overflow: hidden;
-  border: 1.5px solid rgba(255,255,255,0.18);
-  box-shadow: 0 6px 20px rgba(0,0,0,0.4);
-}
 .src-title {
   position: absolute;
   left: 10px;
@@ -401,6 +376,18 @@ const quickSources = computed(() => props.sources.slice(0, 4));
   overflow: hidden;
   background: var(--bg-deep);
   border: 1px solid var(--border-soft);
+}
+.disabled-feature {
+  position: relative;
+  opacity: 0.4;
+  filter: blur(0.5px);
+  pointer-events: none;
+  user-select: none;
+}
+.coming-soon {
+  font-size: 9px;
+  color: var(--text-mute);
+  letter-spacing: 0.4px;
 }
 
 .quick-strip {

@@ -81,6 +81,20 @@ async fn set_mic_muted(muted: bool) -> Result<(), String> {
         .map_err(|e| format!("Failed to join task: {}", e))?
 }
 
+#[tauri::command]
+async fn start_recording(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gstreamer::start_recording(path))
+        .await
+        .map_err(|e| format!("Failed to join task: {}", e))?
+}
+
+#[tauri::command]
+async fn stop_recording() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| gstreamer::stop_recording())
+        .await
+        .map_err(|e| format!("Failed to join task: {}", e))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -91,6 +105,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|_app| {
             #[cfg(windows)]
             {
@@ -106,7 +121,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![start_stream, stop_stream, list_windows, list_monitors, list_audio_inputs, set_mic_muted, get_preview_frame])
+        .invoke_handler(tauri::generate_handler![start_stream, stop_stream, list_windows, list_monitors, list_audio_inputs, set_mic_muted, get_preview_frame, start_recording, stop_recording])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

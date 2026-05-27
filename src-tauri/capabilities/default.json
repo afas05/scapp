@@ -8,6 +8,11 @@
   "permissions": [
     "core:default",
     "opener:default",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [{ "path": "**" }]
+    },
+    "dialog:default",
     "websocket:default",
     "shell:default",
     "store:allow-load",

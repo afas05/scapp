@@ -5,7 +5,6 @@ import StatusDot from '../shared/StatusDot.vue';
 import LivePill from '../shared/LivePill.vue';
 import Sparkline from '../shared/Sparkline.vue';
 import ScreenPlaceholder from '../shared/ScreenPlaceholder.vue';
-import CamPlaceholder from '../shared/CamPlaceholder.vue';
 import SourceCard from '../idle/SourceCard.vue';
 import Stat from './Stat.vue';
 import NetworkBars from './NetworkBars.vue';
@@ -36,6 +35,9 @@ const emit = defineEmits<{
   select: [id: number];
   toggleCamera: [];
   toggleMic: [];
+  openSettings: [];
+  startRecording: [];
+  stopRecording: [];
 }>();
 
 const startedAt = ref(Date.now());
@@ -101,9 +103,11 @@ function toggleRecording() {
   if (recording.value) {
     recording.value = false;
     recStart.value = null;
+    emit('stopRecording');
   } else {
     recording.value = true;
     recStart.value = Date.now();
+    emit('startRecording');
   }
 }
 
@@ -162,7 +166,7 @@ const trendTone = computed<'up' | 'down'>(() => (trend.value >= 0 ? 'up' : 'down
         </Stat>
       </div>
 
-      <button type="button" class="ghost cog">
+      <button type="button" class="ghost cog" @click="emit('openSettings')">
         <Icon name="cog" :size="11" />
       </button>
     </header>
@@ -185,9 +189,6 @@ const trendTone = computed<'up' | 'down'>(() => (trend.value >= 0 ? 'up' : 'down
         <div class="src-proc">{{ selectedSource.processName }}</div>
       </div>
 
-      <div v-if="cameraOn" class="cam-pip">
-        <CamPlaceholder :on="true" />
-      </div>
     </div>
 
     <div class="lower">
@@ -226,13 +227,14 @@ const trendTone = computed<'up' | 'down'>(() => (trend.value >= 0 ? 'up' : 'down
             :muted="false"
             :toggleable="false"
           />
-          <MixerRow
-            icon="cam"
-            label="Cam"
-            :muted="!cameraOn"
-            :show-meter="false"
-            @toggle="emit('toggleCamera')"
-          />
+          <div class="disabled-feature">
+            <MixerRow
+              icon="cam"
+              label="Cam"
+              :muted="true"
+              :show-meter="false"
+            />
+          </div>
         </div>
       </div>
     </div>
@@ -374,17 +376,6 @@ const trendTone = computed<'up' | 'down'>(() => (trend.value >= 0 ? 'up' : 'down
   color: rgba(255,255,255,0.55);
   font-family: 'Geist Mono', monospace;
 }
-.cam-pip {
-  position: absolute;
-  right: 14px;
-  bottom: 14px;
-  width: 88px;
-  aspect-ratio: 4/3;
-  border-radius: 6px;
-  overflow: hidden;
-  border: 1.5px solid rgba(255,255,255,0.20);
-  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
-}
 .lower {
   flex: 0 0 auto;
   padding: 10px 14px;
@@ -434,6 +425,12 @@ const trendTone = computed<'up' | 'down'>(() => (trend.value >= 0 ? 'up' : 'down
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+.disabled-feature {
+  opacity: 0.4;
+  filter: blur(0.5px);
+  pointer-events: none;
+  user-select: none;
 }
 
 .action-bar {

@@ -226,6 +226,7 @@ struct GstreamerState {
     main_loop: Option<glib::MainLoop>,
     bus_watch_guard: Option<gst::bus::BusWatchGuard>,
     stats_stop: Option<Arc<AtomicBool>>,
+    recording: bool,
 }
 
 impl GstreamerState {
@@ -235,6 +236,7 @@ impl GstreamerState {
             main_loop: None,
             bus_watch_guard: None,
             stats_stop: None,
+            recording: false,
         }
     }
 }
@@ -624,11 +626,10 @@ fn link_video_chain(
     capsfilter: &gst::Element,
     videoenc: &gst::Element,
     h264_capsfilter: &gst::Element,
-    rtph264pay: &gst::Element,
 ) -> Result<(), String> {
     pipeline.add_many(&[videoconvert, videoscale, capsfilter])
         .map_err(|_| "Failed to add convert/scale/capsfilter to pipeline".to_string())?;
-    gst::Element::link_many(&[chain_start, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter, rtph264pay])
+    gst::Element::link_many(&[chain_start, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter])
         .map_err(|e| format!("Failed to link video elements: {:?}", e))
 }
 
@@ -642,7 +643,6 @@ fn link_video_chain(
     capsfilter: &gst::Element,
     videoenc: &gst::Element,
     h264_capsfilter: &gst::Element,
-    rtph264pay: &gst::Element,
 ) -> Result<(), String> {
     if src_factory_name == "d3d11screencapturesrc" {
         let d3d11convert = gst::ElementFactory::make("d3d11convert")
@@ -663,7 +663,7 @@ fn link_video_chain(
         d3d11_capsfilter.set_property("caps", &d3d11_caps);
         pipeline.add_many(&[&d3d11convert, &d3d11_capsfilter])
             .map_err(|_| "Failed to add d3d11 zero-copy elements to pipeline".to_string())?;
-        gst::Element::link_many(&[chain_start, &d3d11convert, &d3d11_capsfilter, videoenc, h264_capsfilter, rtph264pay])
+        gst::Element::link_many(&[chain_start, &d3d11convert, &d3d11_capsfilter, videoenc, h264_capsfilter])
             .map_err(|e| format!("Failed to link d3d11 zero-copy chain: {:?}", e))
     } else if src_factory_name == "d3d12screencapturesrc" {
         pipeline.add_many(&[videoconvert, videoscale, capsfilter])
@@ -672,12 +672,12 @@ fn link_video_chain(
             .build()
             .map_err(|_| "d3d12screencapturesrc requires the d3d12download element".to_string())?;
         pipeline.add(&d3d12download).map_err(|_| "Failed to add d3d12download to pipeline".to_string())?;
-        gst::Element::link_many(&[chain_start, &d3d12download, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter, rtph264pay])
+        gst::Element::link_many(&[chain_start, &d3d12download, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter])
             .map_err(|e| format!("Failed to link video elements with d3d12download: {:?}", e))
     } else {
         pipeline.add_many(&[videoconvert, videoscale, capsfilter])
             .map_err(|_| "Failed to add convert/scale/capsfilter to pipeline".to_string())?;
-        gst::Element::link_many(&[chain_start, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter, rtph264pay])
+        gst::Element::link_many(&[chain_start, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter])
             .map_err(|e| format!("Failed to link video elements: {:?}", e))
     }
 }
@@ -1416,6 +1416,18 @@ pub fn create_gstreamer_pipeline(
         .build()
         .map_err(|_| "Failed to create queue_main element".to_string())?;
 
+    // h264_tee splits the encoded H264 stream so recording can tap it
+    // without re-encoding. The recording branch is added dynamically
+    // by start_recording().
+    let h264_tee = gst::ElementFactory::make("tee")
+        .name("h264_tee")
+        .build()
+        .map_err(|_| "Failed to create h264_tee element".to_string())?;
+    let queue_rtp = gst::ElementFactory::make("queue")
+        .name("queue_rtp")
+        .build()
+        .map_err(|_| "Failed to create queue_rtp element".to_string())?;
+
     // Add elements to pipeline. Audio is always wired up here; if the WASAPI
     // device fails to open at runtime, the bus error handler tears down the
     // audio sub-graph at runtime (see `disable_audio_chain`) so the video
@@ -1423,7 +1435,7 @@ pub fn create_gstreamer_pipeline(
     // through the shared rtpbin.
     pipeline.add_many(&[
         &rtpbin, &src, &tee, &queue_main,
-        &videoenc, &h264_capsfilter, &rtph264pay, &rtp_sink,
+        &videoenc, &h264_capsfilter, &h264_tee, &queue_rtp, &rtph264pay, &rtp_sink,
         &rtcp_sink, &rtcp_src,
         &audio_src, &audioconvert, &audioresample, &sys_audio_caps, &opus_capsfilter,
         &opusenc, &rtpopuspay, &audio_rtp_sink, &audio_rtcp_sink, &audio_rtcp_src,
@@ -1442,7 +1454,15 @@ pub fn create_gstreamer_pipeline(
     tee.link(&queue_main)
         .map_err(|e| format!("Failed to link tee → queue_main: {:?}", e))?;
 
-    link_video_chain(&pipeline, &src_factory_name, &queue_main, &videoconvert, &videoscale, &capsfilter, &videoenc, &h264_capsfilter, &rtph264pay)?;
+    link_video_chain(&pipeline, &src_factory_name, &queue_main, &videoconvert, &videoscale, &capsfilter, &videoenc, &h264_capsfilter)?;
+
+    // h264_capsfilter → h264_tee → queue_rtp → rtph264pay
+    gst::Element::link_many(&[&h264_capsfilter, &h264_tee])
+        .map_err(|e| format!("Failed to link h264_capsfilter → h264_tee: {:?}", e))?;
+    h264_tee.link(&queue_rtp)
+        .map_err(|e| format!("Failed to link h264_tee → queue_rtp: {:?}", e))?;
+    gst::Element::link_many(&[&queue_rtp, &rtph264pay])
+        .map_err(|e| format!("Failed to link queue_rtp → rtph264pay: {:?}", e))?;
 
     build_preview_branch(&pipeline, &tee, &src_factory_name);
 
@@ -1774,6 +1794,15 @@ pub fn create_gstreamer_pipeline(
 
 // Cleanup function
 pub fn cleanup() {
+    // Stop recording first if active, so the MP4 is finalized
+    {
+        let state = STATE.lock().unwrap();
+        if state.recording {
+            drop(state);
+            let _ = stop_recording();
+        }
+    }
+
     let mut state = STATE.lock().unwrap();
 
     if let Some(stop) = state.stats_stop.take() {
@@ -1837,5 +1866,104 @@ pub fn start_streaming(
 // Stop streaming function
 pub fn stop_streaming() -> Result<(), String> {
     cleanup();
+    Ok(())
+}
+
+pub fn start_recording(path: String) -> Result<(), String> {
+    let mut state = STATE.lock().unwrap();
+    let pipeline = state.pipeline.as_ref()
+        .ok_or_else(|| "No active pipeline".to_string())?;
+
+    if state.recording {
+        return Err("Already recording".to_string());
+    }
+
+    let h264_tee = pipeline.by_name("h264_tee")
+        .ok_or_else(|| "h264_tee not found in pipeline".to_string())?;
+
+    let make = |factory: &str, name: &str| -> Result<gst::Element, String> {
+        gst::ElementFactory::make(factory).name(name).build()
+            .map_err(|_| format!("Failed to create {} ({})", name, factory))
+    };
+
+    let queue = make("queue", "rec_queue")?;
+    queue.set_property("max-size-buffers", 300u32);
+    queue.set_property_from_str("leaky", "downstream");
+
+    let h264parse = make("h264parse", "rec_h264parse")?;
+
+    let mux = make("mp4mux", "rec_mux")?;
+    mux.set_property_from_str("fragment-duration", "1000");
+
+    let filesink = make("filesink", "rec_filesink")?;
+    filesink.set_property("location", &path);
+    filesink.set_property("sync", false);
+    filesink.set_property("async", false);
+
+    pipeline.add_many(&[&queue, &h264parse, &mux, &filesink])
+        .map_err(|_| "Failed to add recording elements to pipeline".to_string())?;
+
+    gst::Element::link_many(&[&queue, &h264parse, &mux, &filesink])
+        .map_err(|e| format!("Failed to link recording chain: {:?}", e))?;
+
+    // Sync element states with the pipeline before linking to the tee,
+    // so they are PLAYING when data arrives.
+    for el in [&queue, &h264parse, &mux, &filesink] {
+        el.sync_state_with_parent()
+            .map_err(|_| format!("Failed to sync state for {}", el.name()))?;
+    }
+
+    h264_tee.link(&queue)
+        .map_err(|e| format!("Failed to link h264_tee → rec_queue: {:?}", e))?;
+
+    state.recording = true;
+    println!("[Recording] Started recording to {}", path);
+    Ok(())
+}
+
+pub fn stop_recording() -> Result<(), String> {
+    let mut state = STATE.lock().unwrap();
+    let pipeline = state.pipeline.as_ref()
+        .ok_or_else(|| "No active pipeline".to_string())?;
+
+    if !state.recording {
+        return Err("Not recording".to_string());
+    }
+
+    let h264_tee = pipeline.by_name("h264_tee")
+        .ok_or_else(|| "h264_tee not found in pipeline".to_string())?;
+    let rec_queue = pipeline.by_name("rec_queue")
+        .ok_or_else(|| "rec_queue not found in pipeline".to_string())?;
+
+    // Unlink tee from recording queue
+    if let Some(sink_pad) = rec_queue.static_pad("sink") {
+        if let Some(tee_src_pad) = sink_pad.peer() {
+            let _ = tee_src_pad.unlink(&sink_pad);
+            h264_tee.release_request_pad(&tee_src_pad);
+        }
+    }
+
+    // Send EOS to the recording queue to flush and finalize the MP4
+    if let Some(sink_pad) = rec_queue.static_pad("sink") {
+        sink_pad.send_event(gst::event::Eos::new());
+    }
+
+    // Wait briefly for EOS to propagate through mux → filesink
+    std::thread::sleep(Duration::from_millis(500));
+
+    let rec_elements: Vec<gst::Element> = ["rec_queue", "rec_h264parse", "rec_mux", "rec_filesink"]
+        .iter()
+        .filter_map(|name| pipeline.by_name(name))
+        .collect();
+
+    for el in &rec_elements {
+        let _ = el.set_state(gst::State::Null);
+    }
+    for el in &rec_elements {
+        let _ = pipeline.remove(el);
+    }
+
+    state.recording = false;
+    println!("[Recording] Stopped recording");
     Ok(())
 }

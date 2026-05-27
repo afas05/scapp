@@ -2,13 +2,15 @@
 import { onMounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { useUserStore } from './stores/userStore';
+import { useSettingsStore } from './stores/settingsStore';
 
 const userStore = useUserStore();
+const settingsStore = useSettingsStore();
 const router = useRouter();
 const route = useRoute();
 
 onMounted(async () => {
-  await userStore.hydrate();
+  await Promise.all([userStore.hydrate(), settingsStore.hydrate()]);
   if (userStore.isLoggedIn && route.path !== '/start') {
     await router.replace('/start');
   } else if (!userStore.isLoggedIn && route.meta.requiresAuth) {
