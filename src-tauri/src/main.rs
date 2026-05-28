@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    scapp_lib::run()
+    streamsnipe_lib::run()
 }

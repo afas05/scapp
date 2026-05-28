@@ -201,22 +201,22 @@ jobs:
           PLATFORMS='{}'
 
           # Windows NSIS
-          WIN_SIG_FILE="sigs/scapp_${VERSION}_x64-setup.nsis.zip.sig"
+          WIN_SIG_FILE="sigs/StreamSnipe_${VERSION}_x64-setup.nsis.zip.sig"
           if [ -f "$WIN_SIG_FILE" ]; then
             WIN_SIG=$(cat "$WIN_SIG_FILE")
             PLATFORMS=$(echo "$PLATFORMS" | jq \
               --arg sig "$WIN_SIG" \
-              --arg url "${BASE_URL}/scapp_${VERSION}_x64-setup.nsis.zip" \
+              --arg url "${BASE_URL}/StreamSnipe_${VERSION}_x64-setup.nsis.zip" \
               '.["windows-x86_64"] = {"signature": $sig, "url": $url}')
           fi
 
           # Linux AppImage
-          LINUX_SIG_FILE="sigs/scapp_${VERSION}_amd64.AppImage.tar.gz.sig"
+          LINUX_SIG_FILE="sigs/StreamSnipe_${VERSION}_amd64.AppImage.tar.gz.sig"
           if [ -f "$LINUX_SIG_FILE" ]; then
             LINUX_SIG=$(cat "$LINUX_SIG_FILE")
             PLATFORMS=$(echo "$PLATFORMS" | jq \
               --arg sig "$LINUX_SIG" \
-              --arg url "${BASE_URL}/scapp_${VERSION}_amd64.AppImage.tar.gz" \
+              --arg url "${BASE_URL}/StreamSnipe_${VERSION}_amd64.AppImage.tar.gz" \
               '.["linux-x86_64"] = {"signature": $sig, "url": $url}')
           fi
 
@@ -234,3 +234,22 @@ jobs:
           gh release delete-asset "$TAG" latest.json --yes 2>/dev/null || true
           gh release upload "$TAG" latest.json --clobber
           gh release edit "$TAG" --draft=false
+
+          # Notify website to download release files
+          echo "Notifying website..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST https://streamsnipe.live/webhooks/release \
+            -H "Authorization: Bearer ${{ secrets.RELEASE_WEBHOOK_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"tag\": \"${TAG}\",
+              \"files\": [
+                \"StreamSnipe_${VERSION}_x64-setup.exe\",
+                \"streamsnipe_${VERSION}_amd64.deb\",
+                \"StreamSnipe_${VERSION}_amd64.AppImage.tar.gz\"
+              ]
+            }")
+          echo "Webhook response: HTTP ${HTTP_CODE}"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::warning::Website webhook failed with HTTP ${HTTP_CODE}"
+          fi
