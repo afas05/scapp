@@ -1,5 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod gstreamer;
+mod discord_presence;
 mod windows_capture;
 #[cfg(target_os = "linux")]
 mod linux_capture;
@@ -95,6 +96,20 @@ async fn stop_recording() -> Result<(), String> {
         .map_err(|e| format!("Failed to join task: {}", e))?
 }
 
+#[tauri::command]
+async fn discord_set_streaming(producer_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || discord_presence::set_streaming(producer_id))
+        .await
+        .map_err(|e| format!("Failed to join task: {}", e))?
+}
+
+#[tauri::command]
+async fn discord_clear() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| discord_presence::clear())
+        .await
+        .map_err(|e| format!("Failed to join task: {}", e))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -121,7 +136,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![start_stream, stop_stream, list_windows, list_monitors, list_audio_inputs, set_mic_muted, get_preview_frame, start_recording, stop_recording])
+        .invoke_handler(tauri::generate_handler![start_stream, stop_stream, list_windows, list_monitors, list_audio_inputs, set_mic_muted, get_preview_frame, start_recording, stop_recording, discord_set_streaming, discord_clear])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

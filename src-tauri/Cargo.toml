@@ -1,6 +1,6 @@
 [package]
 name = "streamsnipe"
-version = "0.6.1"
+version = "0.6.2"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -37,6 +37,7 @@ lazy_static = "1.4.0"
 image = { version = "0.24", default-features = false, features = ["jpeg"] }
 rayon = "1.10"
 base64 = "0.22"
+discord-rich-presence = "=1.0.0"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

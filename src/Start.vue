@@ -186,6 +186,15 @@ const shareUrl = computed(() => {
   return 'streamsnipe.live';
 });
 
+// Fire-and-forget Tauri invoke — never let presence/etc. failures break streaming.
+async function safeInvoke(cmd: string, args?: Record<string, unknown>) {
+  try {
+    await invoke(cmd, args);
+  } catch (err) {
+    console.warn(`[invoke] ${cmd} failed:`, err);
+  }
+}
+
 mediaSoup.on('producerCreated', (id: string, session: string) => {
   console.log('[MediaSoup] Producer created:', id, 'session:', session);
   producerId.value = id;
@@ -193,6 +202,7 @@ mediaSoup.on('producerCreated', (id: string, session: string) => {
   phase.value = 'live';
   streamStartedAt.value = Date.now();
   peakViewers.value = 0;
+  safeInvoke('discord_set_streaming', { producerId: id });
 });
 
 mediaSoup.on('producerClosed', () => {
@@ -201,6 +211,7 @@ mediaSoup.on('producerClosed', () => {
   phase.value = 'idle';
   producerId.value = '';
   userSession.value = '';
+  safeInvoke('discord_clear');
 });
 
 mediaSoup.on('viewerCount', (count: number) => {
@@ -212,6 +223,7 @@ mediaSoup.on('streamEnded', () => {
   console.log('[MediaSoup] Stream ended by server');
   finalizeSession();
   phase.value = 'idle';
+  safeInvoke('discord_clear');
 });
 
 function finalizeSession() {
@@ -267,6 +279,7 @@ async function stopStream() {
   phase.value = 'idle';
   producerId.value = '';
   userSession.value = '';
+  safeInvoke('discord_clear');
 }
 
 function openStream() {
