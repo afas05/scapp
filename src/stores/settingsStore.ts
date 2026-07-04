@@ -23,6 +23,7 @@ async function defaultRecordingPath(): Promise<string> {
 export const useSettingsStore = defineStore('settings', {
     state: () => ({
         recordingPath: '',
+        visibility: 'public' as 'public' | 'private',
         _hydrated: false,
     }),
     actions: {
@@ -37,11 +38,25 @@ export const useSettingsStore = defineStore('settings', {
                     await store.set('recordingPath', this.recordingPath)
                     await store.save()
                 }
+                const savedVisibility = await store.get<string>('visibility')
+                if (savedVisibility === 'private' || savedVisibility === 'public') {
+                    this.visibility = savedVisibility
+                }
             } catch (err) {
                 console.error('[settingsStore] hydrate failed:', err)
                 this.recordingPath = await defaultRecordingPath()
             } finally {
                 this._hydrated = true
+            }
+        },
+        async setVisibility(visibility: 'public' | 'private') {
+            this.visibility = visibility
+            try {
+                const store = await getStore()
+                await store.set('visibility', visibility)
+                await store.save()
+            } catch (err) {
+                console.error('[settingsStore] Failed to persist visibility:', err)
             }
         },
         async setRecordingPath(path: string) {

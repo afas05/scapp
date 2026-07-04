@@ -12,9 +12,27 @@ if (!newVersion || !/^\d+\.\d+\.\d+(?:-[\w.]+)?$/.test(newVersion)) {
   process.exit(1);
 }
 
+const tauriConfPath = resolve(root, 'src-tauri/tauri.conf.json');
+
+// Guardrail: productName + identifier feed the NSIS install path, shortcut, and uninstall
+// registry entry. Changing either strands every installed user side-by-side (the in-app
+// updater installs to a new location while the old shortcut keeps launching the old version).
+// They were renamed once (scapp -> StreamSnipe in 0.6.1); never let it happen silently again.
+const EXPECTED = { productName: 'StreamSnipe', identifier: 'com.streamsnipe.app' };
+const tauriConf = JSON.parse(readFileSync(tauriConfPath, 'utf8'));
+for (const [k, v] of Object.entries(EXPECTED)) {
+  if (tauriConf[k] !== v) {
+    console.error(
+      `Refusing to bump: tauri.conf.json ${k} is "${tauriConf[k]}", expected "${v}". ` +
+      `Changing productName/identifier breaks the NSIS in-place updater for all existing users.`,
+    );
+    process.exit(1);
+  }
+}
+
 const targets = [
   { path: resolve(root, 'package.json'), key: 'version' },
-  { path: resolve(root, 'src-tauri/tauri.conf.json'), key: 'version' },
+  { path: tauriConfPath, key: 'version' },
 ];
 
 for (const { path, key } of targets) {

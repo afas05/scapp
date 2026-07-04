@@ -20,24 +20,33 @@ export class ProduceRequest {
     const offset = this.bb!.__offset(this.bb_pos, 6);
     return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
   }
-  static startProduceRequest(builder:flatbuffers.Builder) { builder.startObject(2); }
+  access():string|null
+  access(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
+  access(optionalEncoding?:any):string|Uint8Array|null {
+    const offset = this.bb!.__offset(this.bb_pos, 8);
+    return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
+  }
+  static startProduceRequest(builder:flatbuffers.Builder) { builder.startObject(3); }
   static addKind(builder:flatbuffers.Builder, o:flatbuffers.Offset) { builder.addFieldOffset(0, o, 0); }
   static addRtpParameters(builder:flatbuffers.Builder, o:flatbuffers.Offset) { builder.addFieldOffset(1, o, 0); }
+  static addAccess(builder:flatbuffers.Builder, o:flatbuffers.Offset) { builder.addFieldOffset(2, o, 0); }
   static endProduceRequest(builder:flatbuffers.Builder):flatbuffers.Offset { return builder.endObject(); }
-  static createProduceRequest(builder:flatbuffers.Builder, kindOffset:flatbuffers.Offset, rtpParametersOffset:flatbuffers.Offset):flatbuffers.Offset {
+  static createProduceRequest(builder:flatbuffers.Builder, kindOffset:flatbuffers.Offset, rtpParametersOffset:flatbuffers.Offset, accessOffset:flatbuffers.Offset):flatbuffers.Offset {
     ProduceRequest.startProduceRequest(builder);
     ProduceRequest.addKind(builder, kindOffset);
     ProduceRequest.addRtpParameters(builder, rtpParametersOffset);
+    ProduceRequest.addAccess(builder, accessOffset);
     return ProduceRequest.endProduceRequest(builder);
   }
-  unpack(): ProduceRequestT { return new ProduceRequestT(this.kind(), this.rtpParameters()); }
-  unpackTo(_o: ProduceRequestT): void { _o.kind = this.kind(); _o.rtpParameters = this.rtpParameters(); }
+  unpack(): ProduceRequestT { return new ProduceRequestT(this.kind(), this.rtpParameters(), this.access()); }
+  unpackTo(_o: ProduceRequestT): void { _o.kind = this.kind(); _o.rtpParameters = this.rtpParameters(); _o.access = this.access(); }
 }
 export class ProduceRequestT {
-  constructor(public kind: string|Uint8Array|null = null, public rtpParameters: string|Uint8Array|null = null){}
+  constructor(public kind: string|Uint8Array|null = null, public rtpParameters: string|Uint8Array|null = null, public access: string|Uint8Array|null = null){}
   pack(builder:flatbuffers.Builder): flatbuffers.Offset {
     const kind = (this.kind !== null ? builder.createString(this.kind!) : 0);
     const rtpParameters = (this.rtpParameters !== null ? builder.createString(this.rtpParameters!) : 0);
-    return ProduceRequest.createProduceRequest(builder, kind, rtpParameters);
+    const access = (this.access !== null ? builder.createString(this.access!) : 0);
+    return ProduceRequest.createProduceRequest(builder, kind, rtpParameters, access);
   }
 }

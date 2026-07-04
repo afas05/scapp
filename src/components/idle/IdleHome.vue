@@ -36,6 +36,7 @@ const props = withDefaults(defineProps<{
   micDevice?: string;
   availableMics?: MicDevice[];
   camDevice?: string;
+  visibility?: 'public' | 'private';
   lastSession?: { duration: string; peakViewers: number } | null;
   updateStatus?: string;
 }>(), {
@@ -44,6 +45,7 @@ const props = withDefaults(defineProps<{
   micDevice: '',
   availableMics: () => [],
   camDevice: 'Logitech C920',
+  visibility: 'public',
   lastSession: null,
   updateStatus: '',
 });
@@ -56,6 +58,7 @@ const emit = defineEmits<{
   toggleMic: [];
   pickMic: [device: string];
   pickCam: [device: string];
+  pickVisibility: [value: 'public' | 'private'];
   logout: [];
   checkUpdate: [];
   openSettings: [];
@@ -89,6 +92,15 @@ const micDisplayName = computed(() =>
 function onPickMicName(name: string) {
   const found = props.availableMics.find(m => m.name === name);
   if (found) emit('pickMic', found.id);
+}
+
+const VISIBILITY_PUBLIC = 'Public';
+const VISIBILITY_PRIVATE = 'Private (link only)';
+const visibilityLabel = computed(() =>
+  props.visibility === 'private' ? VISIBILITY_PRIVATE : VISIBILITY_PUBLIC
+);
+function onPickVisibility(label: string) {
+  emit('pickVisibility', label === VISIBILITY_PRIVATE ? 'private' : 'public');
 }
 
 // up to 4 cards, plus a "more" tile
@@ -180,6 +192,20 @@ const quickSources = computed(() => props.sources.slice(0, 4));
             subtext="Capture game"
             :on="true"
           />
+
+          <SetupRow
+            icon="share"
+            label="Who can watch"
+            :on="true"
+          >
+            <template #value>
+              <DeviceSelect
+                :value="visibilityLabel"
+                :options="[VISIBILITY_PUBLIC, VISIBILITY_PRIVATE]"
+                @change="onPickVisibility"
+              />
+            </template>
+          </SetupRow>
         </div>
 
         <div class="quick-strip">

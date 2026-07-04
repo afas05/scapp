@@ -62,7 +62,7 @@ export function useMediaSoup() {
         });
     }
 
-    async function startSharing(windowHandle = null, processPid = null, micEnabled = false, micDeviceId = null, monitorIndex = null) {
+    async function startSharing(windowHandle = null, processPid = null, micEnabled = false, micDeviceId = null, monitorIndex = null, access = 'public') {
         // 1a. Video PlainTransport (comedia=true; we just send RTP at it).
         const videoPt = await rpc.request(
             Method.CreateProducerPlainTransport,
@@ -116,7 +116,7 @@ export function useMediaSoup() {
 
         const videoProduceResp = await rpc.request(
             Method.Produce,
-            new ProduceRequestT('video', JSON.stringify(videoRtpParameters)),
+            new ProduceRequestT('video', JSON.stringify(videoRtpParameters), access),
         );
         videoProducerId = videoProduceResp.id();
 
@@ -136,7 +136,7 @@ export function useMediaSoup() {
 
         const audioProduceResp = await rpc.request(
             Method.Produce,
-            new ProduceRequestT('audio', JSON.stringify(audioRtpParameters)),
+            new ProduceRequestT('audio', JSON.stringify(audioRtpParameters), access),
         );
         audioProducerId = audioProduceResp.id();
 

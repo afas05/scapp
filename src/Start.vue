@@ -66,6 +66,7 @@ const errorMessage = ref<string>('');
 const showPicker = ref<boolean>(false);
 const showSettings = ref<boolean>(false);
 const settingsStore = useSettingsStore();
+const visibility = computed(() => settingsStore.visibility);
 const lastSession = ref<{ duration: string; peakViewers: number } | null>(null);
 const streamStartedAt = ref<number>(0);
 const peakViewers = ref<number>(0);
@@ -251,6 +252,7 @@ async function startStream() {
       micOn.value,
       micDevice.value || null,
       src.monitorIndex ?? null,
+      visibility.value,
     );
   } catch (err: any) {
     console.error('[MediaSoup] Failed to start stream:', err);
@@ -400,12 +402,14 @@ onBeforeUnmount(() => {
       :mic-device="micDevice"
       :available-mics="availableMics"
       :cam-device="camDevice"
+      :visibility="visibility"
       :last-session="lastSession"
       :update-status="updateStatus"
       @select="id => (selectedId = id)"
       @open-picker="showPicker = true"
       @toggle-mic="micOn = !micOn"
       @pick-mic="v => (micDevice = v)"
+      @pick-visibility="v => settingsStore.setVisibility(v)"
       @start="startStream"
       @logout="onLogout"
       @check-update="checkForUpdate"
