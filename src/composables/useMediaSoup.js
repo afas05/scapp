@@ -189,5 +189,11 @@ export function useMediaSoup() {
         isConnected.value = false;
     }
 
-    return { isConnected, viewerCount, init, on, startSharing, stopProducing, destroy };
+    // Re-target the live capture source without touching the RPC/SFU session:
+    // GStreamer swaps only its head source element, so the producer keeps running.
+    async function switchSource(windowHandle = null, monitorIndex = null) {
+        await invoke('switch_source', { windowHandle, monitorIndex });
+    }
+
+    return { isConnected, viewerCount, init, on, startSharing, switchSource, stopProducing, destroy };
 }

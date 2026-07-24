@@ -22,12 +22,14 @@ const props = withDefaults(defineProps<{
   viewerCount?: number;
   shareUrl?: string;
   previewFrame?: string;
+  switchingId?: number | null;
 }>(), {
   micDevice: '',
   availableMics: () => [],
   viewerCount: 0,
   shareUrl: 'streamsnipe.live',
   previewFrame: '',
+  switchingId: null,
 });
 
 const emit = defineEmits<{
@@ -111,14 +113,12 @@ function toggleRecording() {
   }
 }
 
-const switchingTo = ref<number | null>(null);
+// Ask the parent to swap the live source; it drives the real backend switch and
+// reflects progress back via the `switchingId` prop (which powers the card's
+// "SWITCHING…" overlay until the operation completes or fails).
 function switchSource(id: number) {
-  if (id === props.selectedId) return;
-  switchingTo.value = id;
-  setTimeout(() => {
-    emit('select', id);
-    switchingTo.value = null;
-  }, 700);
+  if (id === props.selectedId || props.switchingId !== null) return;
+  emit('select', id);
 }
 
 const copied = ref(false);
@@ -203,7 +203,7 @@ const trendTone = computed<'up' | 'down'>(() => (trend.value >= 0 ? 'up' : 'down
             :key="s.id"
             :source="{ id: s.id, kind: s.kind, title: s.title, process: s.processName, thumbnail: s.thumbnail }"
             :selected="s.id === selectedId"
-            :switching="switchingTo === s.id"
+            :switching="switchingId === s.id"
             :compact="true"
             @click="switchSource(s.id)"
           />

@@ -24,6 +24,9 @@ export const useSettingsStore = defineStore('settings', {
     state: () => ({
         recordingPath: '',
         visibility: 'public' as 'public' | 'private',
+        // Paid-tier opt-out for the recording watermark. Default false = shown.
+        // Ignored for free-tier users (their watermark is always applied).
+        hideWatermark: false,
         _hydrated: false,
     }),
     actions: {
@@ -42,6 +45,10 @@ export const useSettingsStore = defineStore('settings', {
                 if (savedVisibility === 'private' || savedVisibility === 'public') {
                     this.visibility = savedVisibility
                 }
+                const savedHideWatermark = await store.get<boolean>('hideWatermark')
+                if (typeof savedHideWatermark === 'boolean') {
+                    this.hideWatermark = savedHideWatermark
+                }
             } catch (err) {
                 console.error('[settingsStore] hydrate failed:', err)
                 this.recordingPath = await defaultRecordingPath()
@@ -57,6 +64,16 @@ export const useSettingsStore = defineStore('settings', {
                 await store.save()
             } catch (err) {
                 console.error('[settingsStore] Failed to persist visibility:', err)
+            }
+        },
+        async setHideWatermark(hide: boolean) {
+            this.hideWatermark = hide
+            try {
+                const store = await getStore()
+                await store.set('hideWatermark', hide)
+                await store.save()
+            } catch (err) {
+                console.error('[settingsStore] Failed to persist hideWatermark:', err)
             }
         },
         async setRecordingPath(path: string) {

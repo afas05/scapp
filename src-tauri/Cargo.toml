@@ -1,6 +1,6 @@
 [package]
 name = "streamsnipe"
-version = "0.6.3"
+version = "0.6.4"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -18,7 +18,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,12 +32,17 @@ tauri-plugin-dialog = "2"
 gstreamer = "0.21.1"
 gstreamer-rtp = "0.21.1"
 gstreamer-video = "0.21.1"
+gstreamer-pbutils = "0.21.0"
 glib = "0.18.0"
 lazy_static = "1.4.0"
 image = { version = "0.24", default-features = false, features = ["jpeg"] }
 rayon = "1.10"
 base64 = "0.22"
 discord-rich-presence = "=1.0.0"
+# Multipart upload of exported clips to the autopost API. reqwest is already in
+# the tree via tauri-plugin-http; declaring it directly enables the multipart
+# form builder.
+reqwest = { version = "0.12", features = ["multipart"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

@@ -22,6 +22,8 @@
     "store:allow-delete",
     "updater:default",
     "process:allow-restart",
+    "core:window:allow-set-size",
+    "core:window:allow-center",
     {
       "identifier": "http:default",
       "allow": [

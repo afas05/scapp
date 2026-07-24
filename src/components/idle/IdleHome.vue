@@ -63,6 +63,7 @@ const emit = defineEmits<{
   checkUpdate: [];
   openSettings: [];
   openRecordings: [];
+  openEditor: [];
 }>();
 
 const selectedMic = computed(() =>
@@ -245,6 +246,7 @@ const quickSources = computed(() => props.sources.slice(0, 4));
       </div>
       <div class="foot-right">
         <span class="foot-link" @click="emit('openSettings')"><Icon name="cog" :size="10" /> Settings</span>
+        <span class="foot-link" @click="emit('openEditor')"><Icon name="scissors" :size="10" /> Edit clips</span>
         <span class="foot-link" @click="emit('openRecordings')"><Icon name="folder" :size="10" /> Recordings</span>
         <span class="foot-link" @click="emit('checkUpdate')">
           <Icon name="refresh" :size="10" />

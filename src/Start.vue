@@ -53,6 +53,7 @@ const phase = ref<Phase>('idle');
 
 const sources = ref<IdleSource[]>([]);
 const selectedId = ref<number>(0);
+const switchingSourceId = ref<number | null>(null);
 const cameraOn = ref<boolean>(false);
 const micOn = ref<boolean>(true);
 const availableMics = ref<MicDevice[]>([]);
@@ -271,6 +272,28 @@ async function onLiveToggleMic() {
   }
 }
 
+// Swap the live capture to another source. Re-targets GStreamer's head source
+// element only — the stream/producer keeps running — so viewers see the new
+// source without a reconnect. Mirrors the window/monitor mapping in startStream().
+async function onLiveSelectSource(id: number) {
+  if (id === selectedId.value || switchingSourceId.value !== null) return;
+  const src = sources.value.find(s => s.id === id);
+  if (!src) return;
+  switchingSourceId.value = id;
+  try {
+    await mediaSoup.switchSource(
+      src.monitorIndex !== undefined ? 0 : src.id,
+      src.monitorIndex ?? null,
+    );
+    selectedId.value = id;
+  } catch (err: any) {
+    console.error('[Source] switch failed:', err);
+    errorMessage.value = `Failed to switch source: ${err?.message ?? err}`;
+  } finally {
+    switchingSourceId.value = null;
+  }
+}
+
 async function stopStream() {
   try {
     await mediaSoup.destroy();
@@ -310,9 +333,12 @@ async function onStartRecording() {
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
   const filename = `recording_${timestamp}.mp4`;
   const filePath = await pathJoin(dir, filename);
+  // Free tier (plan 1) always gets the watermark; paid tier gets it unless the
+  // user opted out in Settings.
+  const watermark = userStore.plan === 1 ? true : !settingsStore.hideWatermark;
   try {
-    await invoke('start_recording', { path: filePath });
-    console.log('[Recording] Started:', filePath);
+    await invoke('start_recording', { path: filePath, watermark });
+    console.log('[Recording] Started:', filePath, 'watermark=', watermark);
   } catch (err: any) {
     console.error('[Recording] Failed to start:', err);
     errorMessage.value = `Recording failed: ${err?.message ?? err}`;
@@ -415,6 +441,7 @@ onBeforeUnmount(() => {
       @check-update="checkForUpdate"
       @open-settings="showSettings = true"
       @open-recordings="openRecordingsFolder"
+      @open-editor="router.push('/editor')"
     />
 
     <LiveDashboard
@@ -428,7 +455,8 @@ onBeforeUnmount(() => {
       :viewer-count="viewerCount"
       :share-url="shareUrl"
       :preview-frame="previewFrame"
-      @select="id => (selectedId = id)"
+      :switching-id="switchingSourceId"
+      @select="onLiveSelectSource"
       @toggle-mic="onLiveToggleMic"
       @stop="stopStream"
       @open-settings="showSettings = true"

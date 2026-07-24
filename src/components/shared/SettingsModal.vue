@@ -1,18 +1,25 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue';
+import { ref, watch, computed } from 'vue';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import Icon from './Icon.vue';
 import { useSettingsStore } from '../../stores/settingsStore';
+import { useUserStore } from '../../stores/userStore';
 
 const props = defineProps<{ modelValue: boolean }>();
 const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>();
 
 const settingsStore = useSettingsStore();
+const userStore = useUserStore();
 const editPath = ref('');
+const editHideWatermark = ref(false);
+
+// Free tier (plan 1) can't remove the watermark, so the control is hidden.
+const isPaid = computed(() => userStore.subscription_tier_id !== 1);
 
 watch(() => props.modelValue, (open) => {
   if (open) {
     editPath.value = settingsStore.recordingPath;
+    editHideWatermark.value = settingsStore.hideWatermark;
   }
 });
 
@@ -22,6 +29,9 @@ function close() {
 
 async function save() {
   await settingsStore.setRecordingPath(editPath.value);
+  if (isPaid.value) {
+    await settingsStore.setHideWatermark(editHideWatermark.value);
+  }
   close();
 }
 
@@ -66,6 +76,14 @@ async function browseFolder() {
               </button>
             </div>
             <p class="setting-hint">Recordings will be saved to this folder</p>
+          </div>
+
+          <div class="setting-group" v-if="isPaid">
+            <label class="toggle-row">
+              <input type="checkbox" v-model="editHideWatermark" />
+              <span class="setting-label">Hide watermark on recordings</span>
+            </label>
+            <p class="setting-hint">Remove the streamsnipe.live watermark from saved recordings</p>
           </div>
         </div>
 
@@ -187,6 +205,23 @@ async function browseFolder() {
   margin: 0;
   font-size: 10px;
   color: var(--text-mute);
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.toggle-row input[type='checkbox'] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.toggle-row .setting-label {
+  cursor: pointer;
 }
 
 .settings-footer {

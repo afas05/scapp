@@ -1,5 +1,6 @@
 use gstreamer as gst;
 use gstreamer_rtp as gst_rtp;
+use gstreamer_pbutils as gst_pbutils;
 use glib;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,6 +41,12 @@ const LOCAL_VIDEO_RTCP_PORT: i32 = 5003;
 const LOCAL_AUDIO_RTCP_PORT: i32 = 5005;
 const VIDEO_SSRC: u32 = 2222;
 const AUDIO_SSRC: u32 = 1111;
+
+// Gap (px) kept between the recording watermark and the video edges. A
+// negative gdkpixbufoverlay offset-x/offset-y means "distance from the
+// right/bottom edge", so passing -WATERMARK_MARGIN anchors the PNG in the
+// bottom-right corner regardless of the video or image size.
+const WATERMARK_MARGIN: i32 = 24;
 
 #[derive(serde::Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -227,6 +234,10 @@ struct GstreamerState {
     bus_watch_guard: Option<gst::bus::BusWatchGuard>,
     stats_stop: Option<Arc<AtomicBool>>,
     recording: bool,
+    // Factory name of the active capture source (e.g. "d3d11screencapturesrc").
+    // The recording branch taps the raw `video_tee` and needs to know which GPU
+    // download element (if any) to insert before the CPU watermark/encode chain.
+    src_factory_name: String,
 }
 
 impl GstreamerState {
@@ -237,6 +248,7 @@ impl GstreamerState {
             bus_watch_guard: None,
             stats_stop: None,
             recording: false,
+            src_factory_name: String::new(),
         }
     }
 }
@@ -723,7 +735,7 @@ fn disable_audio_chain(pipeline: &gst::Pipeline) -> bool {
     let names = [
         "system_audio_src", "audioconvert", "audioresample", "sys_audio_caps",
         "mic_src", "mic_audioconvert", "mic_audioresample", "mic_caps", "mic_valve",
-        "audio_mixer",
+        "audio_mixer", "mixer_out_convert", "audio_tee",
         "opus_capsfilter", "opusenc", "rtpopuspay",
         "audio_rtp_sink", "audio_rtcp_sink", "audio_rtcp_src",
     ];
@@ -1428,6 +1440,17 @@ pub fn create_gstreamer_pipeline(
         .build()
         .map_err(|_| "Failed to create queue_rtp element".to_string())?;
 
+    // audio_tee taps the raw (pre-Opus) PCM so a local recording can grab an
+    // AAC copy of the exact same mixed audio the viewer hears, without
+    // disturbing the live Opus/RTP branch. It sits right before opus_capsfilter
+    // in both the mixer and no-mixer link paths below. With only the live
+    // branch linked it is a transparent pass-through; start_recording() requests
+    // a second src pad at record time and releases it on stop.
+    let audio_tee = gst::ElementFactory::make("tee")
+        .name("audio_tee")
+        .build()
+        .map_err(|_| "Failed to create audio_tee element".to_string())?;
+
     // Add elements to pipeline. Audio is always wired up here; if the WASAPI
     // device fails to open at runtime, the bus error handler tears down the
     // audio sub-graph at runtime (see `disable_audio_chain`) so the video
@@ -1437,8 +1460,9 @@ pub fn create_gstreamer_pipeline(
         &rtpbin, &src, &tee, &queue_main,
         &videoenc, &h264_capsfilter, &h264_tee, &queue_rtp, &rtph264pay, &rtp_sink,
         &rtcp_sink, &rtcp_src,
-        &audio_src, &audioconvert, &audioresample, &sys_audio_caps, &opus_capsfilter,
-        &opusenc, &rtpopuspay, &audio_rtp_sink, &audio_rtcp_sink, &audio_rtcp_src,
+        &audio_src, &audioconvert, &audioresample, &sys_audio_caps, &audio_tee,
+        &opus_capsfilter, &opusenc, &rtpopuspay,
+        &audio_rtp_sink, &audio_rtcp_sink, &audio_rtcp_src,
     ]).map_err(|_| "Failed to add elements to pipeline".to_string())?;
 
     if let Some((ref mic_src, ref mic_ac, ref mic_ar, ref mic_caps, ref mic_valve)) = mic_branch {
@@ -1540,13 +1564,17 @@ pub fn create_gstreamer_pipeline(
         pipeline.add(&mixer_out_convert)
             .map_err(|_| "Failed to add mixer_out_convert to pipeline".to_string())?;
 
-        gst::Element::link_many(&[mixer, &mixer_out_convert, &opus_capsfilter, &opusenc, &rtpopuspay])
-            .map_err(|e| format!("Failed to link mixer to opus chain: {:?}", e))?;
+        gst::Element::link_many(&[mixer, &mixer_out_convert, &audio_tee])
+            .map_err(|e| format!("Failed to link mixer to audio_tee: {:?}", e))?;
+        gst::Element::link_many(&[&audio_tee, &opus_capsfilter, &opusenc, &rtpopuspay])
+            .map_err(|e| format!("Failed to link audio_tee to opus chain: {:?}", e))?;
     } else {
         gst::Element::link_many(&[
-            &audio_src, &audioconvert, &audioresample, &sys_audio_caps, &opus_capsfilter,
-            &opusenc, &rtpopuspay,
-        ]).map_err(|e| format!("Failed to link audio elements: {:?}", e))?;
+            &audio_src, &audioconvert, &audioresample, &sys_audio_caps, &audio_tee,
+        ]).map_err(|e| format!("Failed to link system audio chain to audio_tee: {:?}", e))?;
+        gst::Element::link_many(&[
+            &audio_tee, &opus_capsfilter, &opusenc, &rtpopuspay,
+        ]).map_err(|e| format!("Failed to link audio_tee to opus chain: {:?}", e))?;
     }
 
     rtpopuspay.link_pads(Some("src"), &rtpbin, Some("send_rtp_sink_1"))
@@ -1788,6 +1816,7 @@ pub fn create_gstreamer_pipeline(
     state.bus_watch_guard = Some(bus_watch_guard);
     state.main_loop = Some(main_loop);
     state.stats_stop = Some(stats_stop);
+    state.src_factory_name = src_factory_name;
 
     Ok(())
 }
@@ -1869,17 +1898,100 @@ pub fn stop_streaming() -> Result<(), String> {
     Ok(())
 }
 
-pub fn start_recording(path: String) -> Result<(), String> {
+// Re-target the live capture source (window or monitor) without tearing down the
+// rest of the pipeline. Because window and monitor capture use the *same* source
+// factory (d3d11screencapturesrc on Windows), only the head source element needs
+// to change; the encoder → h264_tee → RTP/preview/recording chain (and therefore
+// the mediasoup producer) stays intact, so viewers keep watching the same stream.
+//
+// `window-handle`/`monitor-index` on the WGC source aren't reliably live-mutable,
+// so we block the source's src pad, cycle the element through NULL, re-apply the
+// properties via the existing `configure_video_source`, and bring it back to
+// PLAYING. A brief black frame during WGC re-init is expected (the UI "switching"
+// overlay covers it).
+pub fn switch_source(window_handle: Option<u64>, monitor_index: Option<u32>) -> Result<(), String> {
+    use std::sync::mpsc;
+
+    let (pipeline, src_factory_name) = {
+        let state = STATE.lock().unwrap();
+        let pipeline = state.pipeline.as_ref()
+            .ok_or_else(|| "No active pipeline".to_string())?
+            .clone();
+        (pipeline, state.src_factory_name.clone())
+    };
+
+    // Window capture requires the WGC-capable d3d11 source. Monitor-only fallbacks
+    // (d3d12screencapturesrc / dx9screencapsrc) can't retarget to a specific window.
+    #[cfg(windows)]
+    if window_handle.filter(|&h| h != 0).is_some() && src_factory_name != "d3d11screencapturesrc" {
+        return Err(format!(
+            "Window capture isn't supported by the active source ({}); only full-monitor capture is available",
+            src_factory_name
+        ));
+    }
+
+    let src = pipeline.by_name(&src_factory_name)
+        .ok_or_else(|| format!("Source element '{}' not found in pipeline", src_factory_name))?;
+    let src_pad = src.static_pad("src")
+        .ok_or_else(|| "Source element has no src pad".to_string())?;
+
+    // Block the source's src pad so we can safely cycle the element through NULL.
+    // The probe callback fires (once) on the streaming thread when flow is blocked;
+    // it signals the calling thread and then keeps the pad blocked (returns Ok)
+    // until we remove the probe. We must NOT set the element to NULL from inside
+    // the callback (that would join the very streaming thread executing it) —
+    // the state cycle is performed here on the calling thread instead.
+    let (tx, rx) = mpsc::channel::<()>();
+    let tx = Mutex::new(Some(tx));
+    let probe_id = src_pad
+        .add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, move |_pad, _info| {
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            gst::PadProbeReturn::Ok
+        })
+        .ok_or_else(|| "Failed to install block probe on source pad".to_string())?;
+
+    // Wait until the pad is actually blocked before touching element state.
+    let _ = rx.recv_timeout(Duration::from_secs(5));
+
+    let cycle = || -> Result<(), String> {
+        src.set_state(gst::State::Null)
+            .map_err(|e| format!("Failed to set source to NULL: {:?}", e))?;
+        configure_video_source(&src, window_handle, monitor_index);
+        src.sync_state_with_parent()
+            .map_err(|e| format!("Failed to bring source back to PLAYING: {:?}", e))?;
+        Ok(())
+    };
+    let result = cycle();
+
+    // Always remove the probe to unblock the pad, even if the cycle failed.
+    src_pad.remove_probe(probe_id);
+
+    println!("[GStreamer] switch_source(window_handle={:?}, monitor_index={:?}) -> {:?}",
+        window_handle, monitor_index, result);
+    result
+}
+
+// Start a local MP4 recording. Unlike the live stream (which shares the single
+// hardware encoder via `h264_tee`), the recording taps the RAW capture tee
+// (`video_tee`) and runs its own convert → optional watermark → encode → mux
+// chain. This is what lets a watermark be burned into the file without touching
+// the live feed. `watermark_path` is Some only when the caller (frontend, based
+// on subscription tier + user setting) wants the overlay; None records clean.
+pub fn start_recording(path: String, watermark_path: Option<std::path::PathBuf>) -> Result<(), String> {
     let mut state = STATE.lock().unwrap();
     let pipeline = state.pipeline.as_ref()
-        .ok_or_else(|| "No active pipeline".to_string())?;
+        .ok_or_else(|| "No active pipeline".to_string())?
+        .clone();
 
     if state.recording {
         return Err("Already recording".to_string());
     }
+    let src_factory_name = state.src_factory_name.clone();
 
-    let h264_tee = pipeline.by_name("h264_tee")
-        .ok_or_else(|| "h264_tee not found in pipeline".to_string())?;
+    let video_tee = pipeline.by_name("video_tee")
+        .ok_or_else(|| "video_tee not found in pipeline".to_string())?;
 
     let make = |factory: &str, name: &str| -> Result<gst::Element, String> {
         gst::ElementFactory::make(factory).name(name).build()
@@ -1889,6 +2001,57 @@ pub fn start_recording(path: String) -> Result<(), String> {
     let queue = make("queue", "rec_queue")?;
     queue.set_property("max-size-buffers", 300u32);
     queue.set_property_from_str("leaky", "downstream");
+
+    // On the GPU capture paths the raw tee carries D3D11/D3D12 memory; download
+    // to system memory before the CPU convert/overlay/encode chain. Mirrors the
+    // element choice in build_preview_branch(). System-memory sources
+    // (ximagesrc/videotestsrc/dx9screencapsrc) need no download.
+    let download: Option<gst::Element> = match src_factory_name.as_str() {
+        "d3d11screencapturesrc" => Some(make("d3d11download", "rec_download")?),
+        "d3d12screencapturesrc" => Some(make("d3d12download", "rec_download")?),
+        _ => None,
+    };
+
+    let convert_in = make("videoconvert", "rec_videoconvert")?;
+    let videoscale = make("videoscale", "rec_videoscale")?;
+    let scale_caps = make("capsfilter", "rec_scale_caps")?;
+    // Match the stream's 1080p; leave format unset so videoconvert/overlay/enc
+    // negotiate one they all accept.
+    scale_caps.set_property("caps", &gst::Caps::builder("video/x-raw")
+        .field("width", 1920i32)
+        .field("height", 1080i32)
+        .build());
+
+    // Watermark overlay — only when a readable PNG was supplied. Anchored
+    // bottom-right (see WATERMARK_* constants).
+    let overlay: Option<gst::Element> = match watermark_path.as_ref().filter(|p| p.exists()) {
+        Some(p) => {
+            let ov = make("gdkpixbufoverlay", "rec_overlay")?;
+            ov.set_property("location", p.to_string_lossy().to_string());
+            // Negative offsets = distance from the right/bottom edge → bottom-right.
+            ov.set_property("offset-x", -WATERMARK_MARGIN);
+            ov.set_property("offset-y", -WATERMARK_MARGIN);
+            ov.set_property("alpha", 0.9f64);
+            Some(ov)
+        }
+        None => {
+            if watermark_path.is_some() {
+                eprintln!("[Recording] watermark file missing, recording without overlay");
+            }
+            None
+        }
+    };
+
+    // Convert to the encoder's input format after the (RGBA-ish) overlay stage.
+    let convert_out = make("videoconvert", "rec_videoconvert2")?;
+
+    // Own encoder for the recording. nvd3d11h264enc is unusable here (its input
+    // is system memory post-download), so use CUDA nvh264enc, falling back to
+    // software x264enc. configure_encoder() reuses the stream's bitrate/GOP.
+    let enc = gst::ElementFactory::make("nvh264enc").name("rec_enc").build()
+        .or_else(|_| gst::ElementFactory::make("x264enc").name("rec_enc").build())
+        .map_err(|_| "No H.264 encoder for recording (tried nvh264enc, x264enc)".to_string())?;
+    configure_encoder(&enc);
 
     let h264parse = make("h264parse", "rec_h264parse")?;
 
@@ -1900,24 +2063,87 @@ pub fn start_recording(path: String) -> Result<(), String> {
     filesink.set_property("sync", false);
     filesink.set_property("async", false);
 
-    pipeline.add_many(&[&queue, &h264parse, &mux, &filesink])
+    // Ordered VIDEO chain (skipping the optional download/overlay when absent).
+    let mut elements: Vec<&gst::Element> = vec![&queue];
+    if let Some(ref d) = download { elements.push(d); }
+    elements.push(&convert_in);
+    elements.push(&videoscale);
+    elements.push(&scale_caps);
+    if let Some(ref ov) = overlay { elements.push(ov); }
+    elements.push(&convert_out);
+    elements.push(&enc);
+    elements.push(&h264parse);
+    elements.push(&mux);
+    elements.push(&filesink);
+
+    pipeline.add_many(&elements)
         .map_err(|_| "Failed to add recording elements to pipeline".to_string())?;
 
-    gst::Element::link_many(&[&queue, &h264parse, &mux, &filesink])
+    gst::Element::link_many(&elements)
         .map_err(|e| format!("Failed to link recording chain: {:?}", e))?;
 
-    // Sync element states with the pipeline before linking to the tee,
-    // so they are PLAYING when data arrives.
-    for el in [&queue, &h264parse, &mux, &filesink] {
+    // Optional AUDIO branch: tap audio_tee (the raw mixed PCM that also feeds the
+    // live Opus stream) and mux an AAC copy into the same MP4 so recordings carry
+    // sound. audio_tee is absent when the audio chain failed to open at runtime
+    // (disable_audio_chain removed it) — then we record video-only.
+    //
+    // IMPORTANT: mp4mux must own BOTH its request pads before it reaches PLAYING;
+    // muxers write their header once and reject pads added mid-stream. So the
+    // audio pad is requested and linked here, BEFORE the sync-to-parent loop.
+    let audio_tee = pipeline.by_name("audio_tee");
+    let (rec_aqueue, audio_els): (Option<gst::Element>, Vec<gst::Element>) = if audio_tee.is_some() {
+        let aqueue = make("queue", "rec_aqueue")?;
+        let aconvert = make("audioconvert", "rec_audioconvert")?;
+        let aresample = make("audioresample", "rec_audioresample")?;
+        // voaacenc (dedicated AAC encoder) with libav's avenc_aac as fallback.
+        let aenc = match gst::ElementFactory::make("voaacenc").name("rec_aacenc").build() {
+            Ok(e) => { e.set_property("bitrate", 128_000i32); e }
+            Err(_) => gst::ElementFactory::make("avenc_aac").name("rec_aacenc").build()
+                .map_err(|_| "No AAC encoder for recording (tried voaacenc, avenc_aac)".to_string())?,
+        };
+        let aparse = make("aacparse", "rec_aacparse")?;
+
+        let a_chain = [&aqueue, &aconvert, &aresample, &aenc, &aparse];
+        pipeline.add_many(&a_chain)
+            .map_err(|_| "Failed to add recording audio elements to pipeline".to_string())?;
+        gst::Element::link_many(&a_chain)
+            .map_err(|e| format!("Failed to link recording audio chain: {:?}", e))?;
+        // AAC caps (audio/mpeg, mpegversion=4) auto-select mp4mux's audio_%u pad.
+        aparse.link(&mux)
+            .map_err(|e| format!("Failed to link rec_aacparse → rec_mux: {:?}", e))?;
+
+        (Some(aqueue.clone()), vec![aqueue, aconvert, aresample, aenc, aparse])
+    } else {
+        eprintln!("[Recording] audio_tee absent (audio disabled); recording video-only");
+        (None, Vec::new())
+    };
+
+    // Sync every recording element (video + audio) with the pipeline before
+    // linking the tees, so they are PLAYING when data arrives.
+    for el in &elements {
+        el.sync_state_with_parent()
+            .map_err(|_| format!("Failed to sync state for {}", el.name()))?;
+    }
+    for el in &audio_els {
         el.sync_state_with_parent()
             .map_err(|_| format!("Failed to sync state for {}", el.name()))?;
     }
 
-    h264_tee.link(&queue)
-        .map_err(|e| format!("Failed to link h264_tee → rec_queue: {:?}", e))?;
+    video_tee.link(&queue)
+        .map_err(|e| format!("Failed to link video_tee → rec_queue: {:?}", e))?;
+
+    if let (Some(tee), Some(aqueue)) = (audio_tee.as_ref(), rec_aqueue.as_ref()) {
+        let tee_src = tee.request_pad_simple("src_%u")
+            .ok_or_else(|| "audio_tee refused src pad request".to_string())?;
+        let aqueue_sink = aqueue.static_pad("sink")
+            .ok_or_else(|| "rec_aqueue has no sink pad".to_string())?;
+        tee_src.link(&aqueue_sink)
+            .map_err(|e| format!("Failed to link audio_tee → rec_aqueue: {:?}", e))?;
+    }
 
     state.recording = true;
-    println!("[Recording] Started recording to {}", path);
+    println!("[Recording] Started recording to {} (watermark={}, audio={})",
+        path, overlay.is_some(), audio_tee.is_some());
     Ok(())
 }
 
@@ -1930,28 +2156,53 @@ pub fn stop_recording() -> Result<(), String> {
         return Err("Not recording".to_string());
     }
 
-    let h264_tee = pipeline.by_name("h264_tee")
-        .ok_or_else(|| "h264_tee not found in pipeline".to_string())?;
+    let video_tee = pipeline.by_name("video_tee")
+        .ok_or_else(|| "video_tee not found in pipeline".to_string())?;
     let rec_queue = pipeline.by_name("rec_queue")
         .ok_or_else(|| "rec_queue not found in pipeline".to_string())?;
 
-    // Unlink tee from recording queue
-    if let Some(sink_pad) = rec_queue.static_pad("sink") {
-        if let Some(tee_src_pad) = sink_pad.peer() {
-            let _ = tee_src_pad.unlink(&sink_pad);
-            h264_tee.release_request_pad(&tee_src_pad);
+    // Detach each branch queue from its tee and release the tee's request pad.
+    // The audio branch is only present when the recording captured sound.
+    let detach = |tee: &gst::Element, branch_queue: &gst::Element| {
+        if let Some(sink_pad) = branch_queue.static_pad("sink") {
+            if let Some(tee_src_pad) = sink_pad.peer() {
+                let _ = tee_src_pad.unlink(&sink_pad);
+                tee.release_request_pad(&tee_src_pad);
+            }
         }
+    };
+    detach(&video_tee, &rec_queue);
+    let rec_aqueue = pipeline.by_name("rec_aqueue");
+    if let (Some(audio_tee), Some(aqueue)) = (pipeline.by_name("audio_tee"), rec_aqueue.as_ref()) {
+        detach(&audio_tee, aqueue);
     }
 
-    // Send EOS to the recording queue to flush and finalize the MP4
+    // Send EOS into EVERY branch feeding the mux. mp4mux writes its moov atom
+    // only after it has seen EOS on ALL of its sink pads, so with an audio
+    // track present both the video and audio branches must be flushed — EOS on
+    // the video branch alone would leave the file unfinalized. The events drain
+    // through the encoders → mux → filesink, so allow time before teardown.
     if let Some(sink_pad) = rec_queue.static_pad("sink") {
         sink_pad.send_event(gst::event::Eos::new());
     }
+    if let Some(aqueue) = rec_aqueue.as_ref() {
+        if let Some(sink_pad) = aqueue.static_pad("sink") {
+            sink_pad.send_event(gst::event::Eos::new());
+        }
+    }
 
-    // Wait briefly for EOS to propagate through mux → filesink
-    std::thread::sleep(Duration::from_millis(500));
+    // Wait for EOS to propagate through encoder(s) → mux → filesink
+    std::thread::sleep(Duration::from_millis(1000));
 
-    let rec_elements: Vec<gst::Element> = ["rec_queue", "rec_h264parse", "rec_mux", "rec_filesink"]
+    // Tear down every element the branch may contain (download/overlay and the
+    // whole audio sub-branch are optional, so filter_map skips absent names).
+    let rec_elements: Vec<gst::Element> = [
+        "rec_queue", "rec_download", "rec_videoconvert", "rec_videoscale",
+        "rec_scale_caps", "rec_overlay", "rec_videoconvert2", "rec_enc",
+        "rec_h264parse",
+        "rec_aqueue", "rec_audioconvert", "rec_audioresample", "rec_aacenc", "rec_aacparse",
+        "rec_mux", "rec_filesink",
+    ]
         .iter()
         .filter_map(|name| pipeline.by_name(name))
         .collect();
@@ -1966,4 +2217,316 @@ pub fn stop_recording() -> Result<(), String> {
     state.recording = false;
     println!("[Recording] Stopped recording");
     Ok(())
+}
+
+// ============================================================================
+// Offline clip export — the "clip studio" backend. These functions are wholly
+// independent of the live streaming STATE pipeline: each builds a throwaway
+// pipeline, runs on a blocking task, and tears itself down. Used by the video
+// editor to turn a recording (or any video) into 9:16 vertical shorts.
+// ============================================================================
+
+#[derive(serde::Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingInfo {
+    pub path: String,
+    pub name: String,
+    pub size_bytes: u64,
+    pub modified_ms: u64,
+    pub duration_secs: f64,
+}
+
+// List *.mp4 files in `dir`, newest first, with size/mtime and a best-effort
+// duration probe (pbutils Discoverer). Duration failures degrade to 0.0 rather
+// than dropping the file from the list.
+pub fn list_recordings(dir: &str) -> Result<Vec<RecordingInfo>, String> {
+    init()?;
+    let read = std::fs::read_dir(dir).map_err(|e| format!("Failed to read {}: {}", dir, e))?;
+
+    // 5 s per-file timeout; if the base plugins can't build the probe pipeline
+    // we simply report unknown durations.
+    let discoverer = gst_pbutils::Discoverer::new(gst::ClockTime::from_seconds(5)).ok();
+
+    let mut out: Vec<RecordingInfo> = Vec::new();
+    for entry in read.flatten() {
+        let path = entry.path();
+        let is_mp4 = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("mp4"))
+            .unwrap_or(false);
+        if !path.is_file() || !is_mp4 { continue; }
+
+        let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+        let modified_ms = meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let duration_secs = discoverer.as_ref().and_then(|d| {
+            let uri = glib::filename_to_uri(&path, None).ok()?;
+            let info = d.discover_uri(&uri).ok()?;
+            info.duration().map(|dur| dur.nseconds() as f64 / 1_000_000_000.0)
+        }).unwrap_or(0.0);
+
+        out.push(RecordingInfo {
+            path: path.to_string_lossy().to_string(),
+            name: path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            size_bytes: meta.len(),
+            modified_ms,
+            duration_secs,
+        });
+    }
+
+    out.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    Ok(out)
+}
+
+// Compute a 9:16 videocrop window (left/right/top/bottom px) for a WxH source.
+// Landscape sources crop horizontally; `offset` (0.0..=1.0) slides which slice
+// is kept. Portrait sources crop vertically. Crop edges are kept even so the
+// H.264 encoder is happy after videoscale normalizes to 1080x1920.
+fn compute_crop(width: i32, height: i32, offset: f32) -> (i32, i32, i32, i32) {
+    let target = 9.0f64 / 16.0;
+    let src_ar = width as f64 / height as f64;
+    let even_floor = |v: i32| if v % 2 != 0 { v - 1 } else { v };
+    if src_ar > target {
+        let crop_w = even_floor((height as f64 * target).round() as i32).max(2);
+        let extra = (width - crop_w).max(0);
+        let mut left = even_floor(((extra as f32) * offset).round() as i32).max(0);
+        if left > extra { left = extra; }
+        (left, extra - left, 0, 0)
+    } else {
+        let crop_h = even_floor((width as f64 / target).round() as i32).max(2);
+        let extra = (height - crop_h).max(0);
+        let mut top = even_floor(((extra as f32) * offset).round() as i32).max(0);
+        if top > extra { top = extra; }
+        (0, 0, top, extra - top)
+    }
+}
+
+fn build_clip_video_branch(
+    pipeline: &gst::Pipeline,
+    mux: &gst::Element,
+    src_pad: &gst::Pad,
+    caps: &gst::Caps,
+    crop_offset: f32,
+    watermark_path: Option<std::path::PathBuf>,
+) -> Result<(), String> {
+    let s = caps.structure(0).ok_or_else(|| "video caps has no structure".to_string())?;
+    let width = s.get::<i32>("width").unwrap_or(1920);
+    let height = s.get::<i32>("height").unwrap_or(1080);
+    let (left, right, top, bottom) = compute_crop(width, height, crop_offset);
+
+    let make = |factory: &str| gst::ElementFactory::make(factory).build()
+        .map_err(|_| format!("Failed to create {}", factory));
+
+    let queue = make("queue")?;
+    let convert1 = make("videoconvert")?;
+    let crop = make("videocrop")?;
+    crop.set_property("left", left);
+    crop.set_property("right", right);
+    crop.set_property("top", top);
+    crop.set_property("bottom", bottom);
+    let scale = make("videoscale")?;
+    let scale_caps = make("capsfilter")?;
+    scale_caps.set_property("caps", &gst::Caps::builder("video/x-raw")
+        .field("width", 1080i32)
+        .field("height", 1920i32)
+        .build());
+
+    // Watermark burned into the exported short (bottom-right), same convention
+    // as the live recording branch.
+    let overlay = match watermark_path.as_ref().filter(|p| p.exists()) {
+        Some(p) => {
+            let ov = make("gdkpixbufoverlay")?;
+            ov.set_property("location", p.to_string_lossy().to_string());
+            ov.set_property("offset-x", -WATERMARK_MARGIN);
+            ov.set_property("offset-y", -WATERMARK_MARGIN);
+            ov.set_property("alpha", 0.9f64);
+            Some(ov)
+        }
+        None => None,
+    };
+    let convert2 = make("videoconvert")?;
+
+    let enc = gst::ElementFactory::make("nvh264enc").build()
+        .or_else(|_| gst::ElementFactory::make("x264enc").build())
+        .map_err(|_| "No H.264 encoder for export (tried nvh264enc, x264enc)".to_string())?;
+    configure_encoder(&enc);
+    let h264parse = make("h264parse")?;
+
+    let mut els: Vec<gst::Element> = vec![
+        queue.clone(), convert1, crop, scale, scale_caps,
+    ];
+    if let Some(ref ov) = overlay { els.push(ov.clone()); }
+    els.push(convert2);
+    els.push(enc);
+    els.push(h264parse.clone());
+
+    let refs: Vec<&gst::Element> = els.iter().collect();
+    pipeline.add_many(&refs).map_err(|_| "Failed to add video branch".to_string())?;
+    gst::Element::link_many(&refs).map_err(|e| format!("Failed to link video branch: {:?}", e))?;
+    h264parse.link(mux).map_err(|e| format!("Failed to link h264parse → mux: {:?}", e))?;
+
+    for el in &els {
+        el.sync_state_with_parent().map_err(|_| format!("Failed to sync {}", el.name()))?;
+    }
+
+    let sink = queue.static_pad("sink").ok_or_else(|| "video queue has no sink".to_string())?;
+    src_pad.link(&sink).map_err(|e| format!("Failed to link decodebin → video queue: {:?}", e))?;
+    Ok(())
+}
+
+fn build_clip_audio_branch(
+    pipeline: &gst::Pipeline,
+    mux: &gst::Element,
+    src_pad: &gst::Pad,
+) -> Result<(), String> {
+    let make = |factory: &str| gst::ElementFactory::make(factory).build()
+        .map_err(|_| format!("Failed to create {}", factory));
+
+    let queue = make("queue")?;
+    let convert = make("audioconvert")?;
+    let resample = make("audioresample")?;
+    let enc = match gst::ElementFactory::make("voaacenc").build() {
+        Ok(e) => { e.set_property("bitrate", 128_000i32); e }
+        Err(_) => gst::ElementFactory::make("avenc_aac").build()
+            .map_err(|_| "No AAC encoder for export (tried voaacenc, avenc_aac)".to_string())?,
+    };
+    let parse = make("aacparse")?;
+
+    let els = [queue.clone(), convert, resample, enc, parse.clone()];
+    let refs: Vec<&gst::Element> = els.iter().collect();
+    pipeline.add_many(&refs).map_err(|_| "Failed to add audio branch".to_string())?;
+    gst::Element::link_many(&refs).map_err(|e| format!("Failed to link audio branch: {:?}", e))?;
+    parse.link(mux).map_err(|e| format!("Failed to link aacparse → mux: {:?}", e))?;
+
+    for el in &els {
+        el.sync_state_with_parent().map_err(|_| format!("Failed to sync {}", el.name()))?;
+    }
+
+    let sink = queue.static_pad("sink").ok_or_else(|| "audio queue has no sink".to_string())?;
+    src_pad.link(&sink).map_err(|e| format!("Failed to link decodebin → audio queue: {:?}", e))?;
+    Ok(())
+}
+
+// Export a single 9:16 clip: cut [start_secs, end_secs] out of `input`, crop to
+// vertical with `crop_offset`, scale to 1080x1920, re-encode video (H.264) +
+// audio (AAC) and mux to `output`. `on_progress(0.0..=1.0)` is called on the
+// caller's thread as the export advances. Cutting is done with a non-segment
+// seek carrying a stop position, so the source emits EOS at `end_secs` and
+// mp4mux finalizes the file naturally.
+pub fn export_clip(
+    input: &str,
+    output: &str,
+    start_secs: f64,
+    end_secs: f64,
+    crop_offset: f32,
+    watermark_path: Option<std::path::PathBuf>,
+    on_progress: impl Fn(f32),
+) -> Result<(), String> {
+    init()?;
+    if end_secs <= start_secs {
+        return Err("Clip end must be after start".to_string());
+    }
+    let crop_offset = crop_offset.clamp(0.0, 1.0);
+    if let Some(parent) = std::path::Path::new(output).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let pipeline = gst::Pipeline::new();
+    let filesrc = gst::ElementFactory::make("filesrc").property("location", input).build()
+        .map_err(|_| "Failed to create filesrc".to_string())?;
+    let decodebin = gst::ElementFactory::make("decodebin").name("dec").build()
+        .map_err(|_| "Failed to create decodebin".to_string())?;
+    let mux = gst::ElementFactory::make("mp4mux").name("clip_mux").build()
+        .map_err(|_| "Failed to create mp4mux".to_string())?;
+    let filesink = gst::ElementFactory::make("filesink").property("location", output).build()
+        .map_err(|_| "Failed to create filesink".to_string())?;
+
+    pipeline.add_many([&filesrc, &decodebin, &mux, &filesink])
+        .map_err(|_| "Failed to add export elements".to_string())?;
+    gst::Element::link_many([&filesrc, &decodebin])
+        .map_err(|e| format!("Failed to link filesrc → decodebin: {:?}", e))?;
+    gst::Element::link_many([&mux, &filesink])
+        .map_err(|e| format!("Failed to link mux → filesink: {:?}", e))?;
+
+    // decodebin exposes its decoded pads during preroll; link the first video
+    // and first audio pad into their branches. Flags guard against extra pads.
+    let video_linked = Arc::new(AtomicBool::new(false));
+    let audio_linked = Arc::new(AtomicBool::new(false));
+    let pipeline_weak = pipeline.downgrade();
+    let mux_weak = mux.downgrade();
+    let vflag = video_linked.clone();
+    let aflag = audio_linked.clone();
+    let wm = watermark_path.clone();
+    decodebin.connect_pad_added(move |_dbin, pad| {
+        let pipeline = match pipeline_weak.upgrade() { Some(p) => p, None => return };
+        let mux = match mux_weak.upgrade() { Some(m) => m, None => return };
+        let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
+        let media = caps.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
+        if media.starts_with("video/") {
+            if vflag.swap(true, Ordering::SeqCst) { return; }
+            if let Err(e) = build_clip_video_branch(&pipeline, &mux, pad, &caps, crop_offset, wm.clone()) {
+                eprintln!("[Export] video branch failed: {}", e);
+            }
+        } else if media.starts_with("audio/") {
+            if aflag.swap(true, Ordering::SeqCst) { return; }
+            if let Err(e) = build_clip_audio_branch(&pipeline, &mux, pad) {
+                eprintln!("[Export] audio branch failed: {}", e);
+            }
+        }
+    });
+
+    // PAUSE to preroll — this resolves decodebin's pads and links the branches
+    // into the muxer while everything is still below PLAYING.
+    pipeline.set_state(gst::State::Paused)
+        .map_err(|_| format!("Failed to pause export pipeline{}", drain_bus_errors(&pipeline)))?;
+    let (res, _cur, _pending) = pipeline.state(Some(gst::ClockTime::from_seconds(15)));
+    if res.is_err() {
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err(format!("Export preroll failed{}", drain_bus_errors(&pipeline)));
+    }
+
+    let start = gst::ClockTime::from_nseconds((start_secs * 1_000_000_000.0) as u64);
+    let stop = gst::ClockTime::from_nseconds((end_secs * 1_000_000_000.0) as u64);
+    pipeline.seek(1.0, gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+        gst::SeekType::Set, start, gst::SeekType::Set, stop)
+        .map_err(|_| "Failed to seek export pipeline to clip range".to_string())?;
+
+    pipeline.set_state(gst::State::Playing)
+        .map_err(|_| format!("Failed to start export pipeline{}", drain_bus_errors(&pipeline)))?;
+
+    let bus = pipeline.bus().ok_or_else(|| "Export pipeline has no bus".to_string())?;
+    let span = (end_secs - start_secs).max(0.001);
+    on_progress(0.0);
+    let result = loop {
+        match bus.timed_pop_filtered(
+            gst::ClockTime::from_mseconds(200),
+            &[gst::MessageType::Error, gst::MessageType::Eos],
+        ) {
+            Some(msg) => match msg.view() {
+                gst::MessageView::Eos(..) => break Ok(()),
+                gst::MessageView::Error(err) => {
+                    break Err(format!("Export error from {:?}: {} debug={:?}",
+                        err.src().map(|s| s.path_string().to_string()),
+                        err.error(), err.debug()));
+                }
+                _ => {}
+            },
+            None => {
+                if let Some(pos) = pipeline.query_position::<gst::ClockTime>() {
+                    let pos_s = pos.nseconds() as f64 / 1_000_000_000.0;
+                    let pct = (((pos_s - start_secs) / span).clamp(0.0, 1.0)) as f32;
+                    on_progress(pct);
+                }
+            }
+        }
+    };
+
+    let _ = pipeline.set_state(gst::State::Null);
+    match result {
+        Ok(()) => { on_progress(1.0); Ok(()) }
+        Err(e) => Err(e),
+    }
 }

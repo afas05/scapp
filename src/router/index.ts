@@ -2,11 +2,13 @@ import {createRouter, createWebHashHistory, RouteRecordRaw} from "vue-router";
 import { useUserStore } from "../stores/userStore";
 import Start from "../Start.vue";
 import Login from "../Login.vue";
+import Editor from "../Editor.vue";
 
 const routes: RouteRecordRaw[] = [
     { path: "/", redirect: '/start' },
     { path: "/login", component: Login },
     { path: "/start", component: Start, meta: { requiresAuth: true } },
+    { path: "/editor", component: Editor, meta: { requiresAuth: true } },
 ];
 
 const router = createRouter({
