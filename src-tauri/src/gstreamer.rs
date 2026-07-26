@@ -726,6 +726,41 @@ fn find_pipeline(start: &gst::Object) -> Option<gst::Pipeline> {
     None
 }
 
+// A pipeline that has been built — let alone started — must be walked back to
+// NULL before its last reference goes away. Dropping a live pipeline lets
+// GstBin::dispose unref the children in arbitrary order, and the RTCP udpsink can
+// then finalize the GSocket it shares with its udpsrc (see the comedia socket
+// sharing near the end of `create_gstreamer_pipeline`) while the udpsrc task
+// thread is still parked in `g_socket_condition_timed_wait` on that same socket.
+// That trips `g_assert (socket->priv->requested_conditions == NULL)` in gio's
+// g_socket_finalize, which calls abort() — killing the whole process, with no
+// error surfaced, from a path Rust cannot catch.
+//
+// An orderly set_state(Null) is safe: it runs each element's unlock()/stop(), the
+// udpsrc threads return from the condition wait and deregister their watches, and
+// the socket's last ref is dropped only afterwards.
+struct PipelineTeardownGuard(Option<gst::Pipeline>);
+
+impl PipelineTeardownGuard {
+    fn new(pipeline: &gst::Pipeline) -> Self {
+        PipelineTeardownGuard(Some(pipeline.clone()))
+    }
+
+    // Call once the pipeline is owned by STATE, so `cleanup()` takes over teardown.
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for PipelineTeardownGuard {
+    fn drop(&mut self) {
+        if let Some(pipeline) = self.0.take() {
+            let _ = pipeline.set_state(gst::State::Null);
+            let _ = pipeline.state(gst::ClockTime::from_seconds(2));
+        }
+    }
+}
+
 // Tear the audio chain out of a running pipeline so an audio source failure
 // can't take video down with it. The source failure leaves the element in
 // ERROR state, which propagates GST_FLOW_ERROR upstream through rtpbin's
@@ -737,6 +772,14 @@ fn disable_audio_chain(pipeline: &gst::Pipeline) -> bool {
         "mic_src", "mic_audioconvert", "mic_audioresample", "mic_caps", "mic_valve",
         "audio_mixer", "mixer_out_convert", "audio_tee",
         "opus_capsfilter", "opusenc", "rtpopuspay",
+        // Order matters for the last two and this list is walked in order below:
+        // `audio_rtcp_sink` shares its GSocket with `audio_rtcp_src`, so the sink
+        // must go NULL (dropping its ref) before the src does. The src's own NULL
+        // transition stops its task thread and deregisters that thread's socket
+        // condition watch before dropping the final ref. The reverse order would
+        // finalize the socket while the udpsrc thread is still parked in
+        // g_socket_condition_timed_wait on it, which abort()s the process — see
+        // PipelineTeardownGuard. Do not reorder these two.
         "audio_rtp_sink", "audio_rtcp_sink", "audio_rtcp_src",
     ];
     let elements: Vec<gst::Element> = names.iter()
@@ -1025,6 +1068,11 @@ pub fn create_gstreamer_pipeline(
 
     // Create a pipeline
     let pipeline = gst::Pipeline::new();
+    // Armed here rather than just before the PLAYING transition: every `?` from
+    // this point on would otherwise drop a partially built (and, past the socket
+    // sharing below, a running) pipeline without a NULL transition. Disarmed once
+    // the pipeline is handed to STATE.
+    let teardown_guard = PipelineTeardownGuard::new(&pipeline);
     let rtpbin = gst::ElementFactory::make("rtpbin")
         .name("rtpbin")
         .build()
@@ -1811,7 +1859,8 @@ pub fn create_gstreamer_pipeline(
         eprintln!("[stats] logger thread exiting");
     });
 
-    // Store state
+    // Store state — from here on `cleanup()` owns teardown of this pipeline.
+    teardown_guard.disarm();
     state.pipeline = Some(pipeline);
     state.bus_watch_guard = Some(bus_watch_guard);
     state.main_loop = Some(main_loop);
