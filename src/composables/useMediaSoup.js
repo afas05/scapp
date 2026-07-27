@@ -143,7 +143,9 @@ export function useMediaSoup() {
         // 3. Spin up the native GStreamer pipeline targeting both PlainTransports.
         //    comedia=true means the SFU latches onto whatever source ip:port our
         //    RTP arrives from — no connect step needed for either kind.
-        await invoke('start_stream', {
+        //    The pipeline degrades rather than failing when an audio device
+        //    can't be opened, and reports what it settled for.
+        const status = await invoke('start_stream', {
             videoHost: videoPt.ip(),
             videoRtpPort: videoPt.port(),
             videoRtcpPort: videoPt.rtcpPort(),
@@ -163,6 +165,8 @@ export function useMediaSoup() {
         // The viewer subscribes to the video producer id; audio is paired by
         // the SFU under the same session. Surface the video id to the UI.
         if (onProducerCreated) onProducerCreated(videoProduceResp.id(), videoProduceResp.userSession());
+
+        return status;
     }
 
     async function stopProducing() {

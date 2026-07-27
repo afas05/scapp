@@ -45,7 +45,7 @@ async fn start_stream(
     mic_enabled: Option<bool>,
     mic_device_id: Option<String>,
     mic_initially_muted: Option<bool>,
-) -> Result<String, String> {
+) -> Result<gstreamer::StreamStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         gstreamer::start_streaming(
             video_host,

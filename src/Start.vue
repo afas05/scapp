@@ -64,6 +64,8 @@ const producerId = ref<string>('');
 const userSession = ref<string>('');
 const viewerCount = ref<number>(0);
 const errorMessage = ref<string>('');
+// Non-fatal: the stream is live, but with less audio than was asked for.
+const noticeMessage = ref<string>('');
 const showPicker = ref<boolean>(false);
 const showSettings = ref<boolean>(false);
 const settingsStore = useSettingsStore();
@@ -211,6 +213,7 @@ mediaSoup.on('producerClosed', () => {
   console.log('[MediaSoup] Producer closed');
   finalizeSession();
   phase.value = 'idle';
+  noticeMessage.value = '';
   producerId.value = '';
   userSession.value = '';
   safeInvoke('discord_clear');
@@ -225,6 +228,7 @@ mediaSoup.on('streamEnded', () => {
   console.log('[MediaSoup] Stream ended by server');
   finalizeSession();
   phase.value = 'idle';
+  noticeMessage.value = '';
   safeInvoke('discord_clear');
 });
 
@@ -241,13 +245,14 @@ function finalizeSession() {
 async function startStream() {
   if (!selectedSource.value) return;
   errorMessage.value = '';
+  noticeMessage.value = '';
   phase.value = 'connecting';
   try {
     const config = await loadConfig();
     console.log('[MediaSoup] Connecting to SFU:', config.sfuWsUrl);
     await mediaSoup.init(userStore.sessionHash, config);
     const src = selectedSource.value;
-    await mediaSoup.startSharing(
+    const status = await mediaSoup.startSharing(
       src.monitorIndex !== undefined ? 0 : src.id,
       src.pid,
       micOn.value,
@@ -255,6 +260,13 @@ async function startStream() {
       src.monitorIndex ?? null,
       visibility.value,
     );
+    // The pipeline degrades instead of failing when an audio device won't
+    // open; say so rather than letting the user find out from their viewers.
+    if (status?.notice) {
+      console.warn('[MediaSoup] Started with reduced audio:', status);
+      noticeMessage.value = status.notice;
+    }
+    if (status?.mic === 'failed') micOn.value = false;
   } catch (err: any) {
     console.error('[MediaSoup] Failed to start stream:', err);
     errorMessage.value = `Failed to start stream: ${err?.message ?? err}`;
@@ -417,6 +429,10 @@ onBeforeUnmount(() => {
 <template>
   <div class="start-shell">
     <div v-if="errorMessage" class="error-banner">{{ errorMessage }}</div>
+    <div v-else-if="noticeMessage" class="notice-banner">
+      <span>{{ noticeMessage }}</span>
+      <button class="notice-dismiss" @click="noticeMessage = ''" aria-label="Dismiss">×</button>
+    </div>
 
     <IdleHome
       v-if="phase === 'idle'"
@@ -501,6 +517,35 @@ onBeforeUnmount(() => {
   border-radius: 8px;
   padding: 0.6rem 0.8rem;
   font-size: 11px;
+}
+/* Same slot as .error-banner, but amber: the stream is live, something is just
+   missing from it. Dismissible, since it isn't blocking anything. */
+.notice-banner {
+  position: absolute;
+  top: 8px;
+  left: 14px;
+  right: 14px;
+  z-index: 40;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  color: #f0b429;
+  background-color: rgba(240, 180, 41, 0.1);
+  border: 1px solid #f0b429;
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  font-size: 11px;
+}
+.notice-dismiss {
+  margin-left: auto;
+  flex: none;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0;
 }
 .open-stream {
   position: absolute;

@@ -56,6 +56,19 @@ pub struct MicDevice {
     pub is_default: bool,
 }
 
+// What the pipeline actually managed to capture, returned from `start_stream` so
+// the UI can say when the user got less than they asked for. `notice` is
+// non-fatal by construction — if it is set, the stream is live regardless.
+#[derive(serde::Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamStatus {
+    /// "process" | "system" | "silence" | "none"
+    pub system_audio: &'static str,
+    /// "on" | "failed" | "off"
+    pub mic: &'static str,
+    pub notice: Option<String>,
+}
+
 // Snapshot the GstDevice list and extract a stable wasapi endpoint id for
 // each — used both for the frontend listing (`MicDevice.id`) and to look the
 // device back up at start_streaming time so wasapi2src is built via
@@ -125,6 +138,16 @@ fn enumerate_audio_input_devices() -> Vec<(gst::Device, String, String, bool)> {
     out
 }
 
+// Display names wasapi2's device provider gives its two pseudo-devices. These
+// are not real endpoints — they stand for "whatever Windows currently considers
+// default" and only resolve to a concrete endpoint when the element is opened.
+// See `enumerate_audio_input_devices` for why we refuse to hand them to
+// wasapi2src.
+#[cfg(windows)]
+const DEFAULT_CAPTURE_PSEUDO_DEVICE: &str = "Default Audio Capture Device";
+#[cfg(windows)]
+const DEFAULT_RENDER_PSEUDO_DEVICE: &str = "Default Audio Render Device";
+
 #[cfg(windows)]
 fn enumerate_audio_input_devices() -> Vec<(gst::Device, String, String, bool)> {
     let monitor = gst::DeviceMonitor::new();
@@ -136,6 +159,10 @@ fn enumerate_audio_input_devices() -> Vec<(gst::Device, String, String, bool)> {
 
     let mut out: Vec<(gst::Device, String, String, bool)> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Concrete endpoint id the capture pseudo-device resolves to, i.e. the one
+    // Windows currently treats as the default mic. Used to flag the matching
+    // real entry below.
+    let mut default_hint: Option<String> = None;
 
     for device in monitor.devices() {
         let name = device.display_name().to_string();
@@ -179,6 +206,21 @@ fn enumerate_audio_input_devices() -> Vec<(gst::Device, String, String, bool)> {
                 })
             });
 
+        // Drop the pseudo-devices before the id checks below — the capture one
+        // is listed first and is auto-selected as the default mic, which is how
+        // it ends up in the pipeline. Opening it makes wasapi2src resolve the
+        // default endpoint at activation time, which races the loopback source's
+        // own activation on the plugin's shared activation path and
+        // intermittently fails with "Failed to open device" — reported against
+        // whichever of the two lost the race, usually `system_audio_src`. We
+        // keep its resolved id only as a hint for which real entry is default.
+        if name == DEFAULT_CAPTURE_PSEUDO_DEVICE || name == DEFAULT_RENDER_PSEUDO_DEVICE {
+            if name == DEFAULT_CAPTURE_PSEUDO_DEVICE {
+                default_hint = id.filter(|s| !s.is_empty());
+            }
+            continue;
+        }
+
         let id = match id {
             Some(s) if !s.is_empty() => s,
             _ => continue,
@@ -198,6 +240,13 @@ fn enumerate_audio_input_devices() -> Vec<(gst::Device, String, String, bool)> {
 
     monitor.stop();
 
+    // Prefer the endpoint the pseudo-default resolved to, then any entry the
+    // provider flagged itself, then just the first one.
+    if let Some(hint) = default_hint {
+        if let Some(entry) = out.iter_mut().find(|(_, id, _, _)| *id == hint) {
+            entry.3 = true;
+        }
+    }
     if !out.is_empty() && !out.iter().any(|(_, _, _, def)| *def) {
         out[0].3 = true;
     }
@@ -517,8 +566,43 @@ fn create_video_encoder(src_factory_name: &str) -> Result<gst::Element, String> 
 
 // --- Platform-specific system audio source creation ---
 
+// What is actually feeding the system-audio branch. Reported to the frontend so
+// it can tell the user when they got less than they asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SysAudioMode {
+    /// Loopback scoped to the captured window's process tree.
+    ProcessLoopback,
+    /// Whole-system loopback on the default render endpoint.
+    SystemLoopback,
+    /// No capturable endpoint; a silent source stands in for it.
+    Silence,
+}
+
+// Stand-in for a system-audio source that cannot be opened. Named
+// `system_audio_src` so `add_many`, the link block, `disable_audio_chain` and
+// `bus_call`'s error matcher all stay unchanged — the graph keeps its shape and
+// only the head element differs.
+//
+// `is-live=true` is required, not cosmetic: `audio_rtp_sink` runs `sync=false`,
+// so a default (non-live) audiotestsrc would push as fast as the CPU allows and
+// race Opus packets far ahead of wall clock. Live mode paces on the pipeline
+// clock, exactly like wasapi2src does.
+//
+// `samplesperbuffer=960` is 20 ms at 48 kHz, matching opusenc's frame size; the
+// 1024 default gives a 21.3 ms cadence that opusenc then has to rebuffer.
+fn create_silent_audio_source() -> Result<gst::Element, String> {
+    let el = gst::ElementFactory::make("audiotestsrc")
+        .name("system_audio_src")
+        .build()
+        .map_err(|_| "audiotestsrc unavailable — cannot substitute silence for system audio".to_string())?;
+    el.set_property_from_str("wave", "silence");
+    el.set_property("is-live", true);
+    el.set_property("samplesperbuffer", 960i32);
+    Ok(el)
+}
+
 #[cfg(target_os = "linux")]
-fn create_system_audio_source(_process_pid: Option<u32>) -> Result<gst::Element, String> {
+fn create_system_audio_source(_process_pid: Option<u32>) -> Result<(gst::Element, SysAudioMode), String> {
     let src = gst::ElementFactory::make("pulsesrc")
         .name("system_audio_src")
         .build()
@@ -532,7 +616,9 @@ fn create_system_audio_source(_process_pid: Option<u32>) -> Result<gst::Element,
         src.set_property("device", &monitor_name);
     }
 
-    Ok(src)
+    // PulseAudio monitors are whole-sink; there is no per-process equivalent
+    // here, so dropping the pid on a retry would change nothing.
+    Ok((src, SysAudioMode::SystemLoopback))
 }
 
 #[cfg(target_os = "linux")]
@@ -568,26 +654,32 @@ fn find_default_monitor_source() -> Option<String> {
 }
 
 #[cfg(windows)]
-fn create_system_audio_source(process_pid: Option<u32>) -> Result<gst::Element, String> {
+fn create_system_audio_source(process_pid: Option<u32>) -> Result<(gst::Element, SysAudioMode), String> {
     let audio_src = gst::ElementFactory::make("wasapi2src")
         .name("system_audio_src")
         .build()
         .map_err(|_| "Failed to create wasapi2src element".to_string())?;
     audio_src.set_property("loopback", true);
     audio_src.set_property("low-latency", true);
+    let mut mode = SysAudioMode::SystemLoopback;
     if let Some(pid) = process_pid.filter(|&p| p != 0) {
         let mode_set = audio_src.find_property("loopback-mode").is_some();
         let pid_set = audio_src.find_property("loopback-target-pid").is_some();
         if mode_set && pid_set {
             audio_src.set_property_from_str("loopback-mode", "include-process-tree");
             audio_src.set_property("loopback-target-pid", pid);
+            mode = SysAudioMode::ProcessLoopback;
         }
     }
-    Ok(audio_src)
+    Ok((audio_src, mode))
 }
 
 // --- Platform-specific mic source creation ---
 
+// Both platforms: an id that no longer matches an enumerated device means the
+// mic was unplugged or disabled since the list was built, or the frontend held
+// on to a stale id. Setting it on a bare element just moves the failure to open
+// time; erroring here lets the caller drop the mic branch and stream on.
 #[cfg(target_os = "linux")]
 fn create_mic_source(dev_id: &str) -> Result<gst::Element, String> {
     let devices = enumerate_audio_input_devices();
@@ -596,14 +688,7 @@ fn create_mic_source(dev_id: &str) -> Result<gst::Element, String> {
         Some((dev, _, _, _)) => dev
             .create_element(Some("mic_src"))
             .map_err(|e| format!("Failed to create mic element from device: {:?}", e)),
-        None => {
-            let el = gst::ElementFactory::make("pulsesrc")
-                .name("mic_src")
-                .build()
-                .map_err(|_| "Failed to create pulsesrc for mic input".to_string())?;
-            el.set_property("device", dev_id);
-            Ok(el)
-        }
+        None => Err(format!("Mic device '{}' is no longer available", dev_id)),
     }
 }
 
@@ -615,15 +700,43 @@ fn create_mic_source(dev_id: &str) -> Result<gst::Element, String> {
         Some((dev, _, _, _)) => dev
             .create_element(Some("mic_src"))
             .map_err(|e| format!("Failed to create mic element from device: {:?}", e)),
-        None => {
-            let el = gst::ElementFactory::make("wasapi2src")
-                .name("mic_src")
-                .build()
-                .map_err(|_| "Failed to create wasapi2src for mic input".to_string())?;
-            el.set_property("device", dev_id);
-            Ok(el)
-        }
+        None => Err(format!("Mic device '{}' is no longer available", dev_id)),
     }
+}
+
+// mic_src, mic_audioconvert, mic_audioresample, mic_caps, mic_valve
+type MicBranch = (gst::Element, gst::Element, gst::Element, gst::Element, gst::Element);
+
+// Build the mic branch's elements. Split out of the pipeline builder so the
+// caller can swallow a failure and carry on without a mic instead of unwinding
+// the whole stream start.
+fn build_mic_branch(
+    mic_src: gst::Element,
+    mixer_in_caps: &gst::Caps,
+    mic_enabled: bool,
+    mic_initially_muted: bool,
+) -> Result<MicBranch, String> {
+    let mic_audioconvert = gst::ElementFactory::make("audioconvert")
+        .name("mic_audioconvert")
+        .build()
+        .map_err(|_| "Failed to create mic audioconvert".to_string())?;
+    let mic_audioresample = gst::ElementFactory::make("audioresample")
+        .name("mic_audioresample")
+        .build()
+        .map_err(|_| "Failed to create mic audioresample".to_string())?;
+    let mic_caps = gst::ElementFactory::make("capsfilter")
+        .name("mic_caps")
+        .build()
+        .map_err(|_| "Failed to create mic capsfilter".to_string())?;
+    mic_caps.set_property("caps", mixer_in_caps);
+    let mic_valve = gst::ElementFactory::make("valve")
+        .name("mic_valve")
+        .build()
+        .map_err(|_| "Failed to create mic valve element".to_string())?;
+    // drop=true → discards buffers immediately (mute). The mic branch is
+    // always wired into the mixer; the valve gates flow at runtime.
+    mic_valve.set_property("drop", mic_initially_muted || !mic_enabled);
+    Ok((mic_src, mic_audioconvert, mic_audioresample, mic_caps, mic_valve))
 }
 
 // --- Platform-specific video chain linking ---
@@ -833,6 +946,91 @@ fn disable_audio_chain(pipeline: &gst::Pipeline) -> bool {
     true
 }
 
+// Drop just the mic branch, leaving system audio and video untouched. Same shape
+// as `disable_audio_chain` but scoped to the five mic elements and the audiomixer
+// request pad the valve occupies — audiomixer runs fine on its one remaining
+// sink, and `set_mic_muted` already no-ops once `mic_valve` is gone.
+fn disable_mic_branch(pipeline: &gst::Pipeline) -> bool {
+    let names = [
+        "mic_src", "mic_audioconvert", "mic_audioresample", "mic_caps", "mic_valve",
+    ];
+    let elements: Vec<gst::Element> = names.iter()
+        .filter_map(|n| pipeline.by_name(n))
+        .collect();
+    if elements.is_empty() {
+        return false;
+    }
+
+    // Release the mixer pad the valve feeds so the mixer isn't left with a
+    // dangling peer / leaked request pad after the elements are removed.
+    if let Some(valve) = pipeline.by_name("mic_valve") {
+        if let Some(pad) = valve.static_pad("src") {
+            if let Some(peer) = pad.peer() {
+                let _ = pad.unlink(&peer);
+                if let Some(parent) = peer.parent_element() {
+                    parent.release_request_pad(&peer);
+                }
+            }
+        }
+    }
+
+    for el in &elements {
+        let _ = el.set_state(gst::State::Null);
+    }
+    for el in &elements {
+        let _ = pipeline.remove(el);
+    }
+    true
+}
+
+// Replace the head of the system-audio branch in place. `system_audio_src` has
+// no upstream and exactly one peer (`audioconvert`), so the swap stays local —
+// nothing downstream of the convert notices. The caller opens the replacement.
+fn swap_system_audio_src(pipeline: &gst::Pipeline, new_src: &gst::Element) -> Result<(), String> {
+    let downstream = pipeline.by_name("audioconvert")
+        .ok_or_else(|| "audioconvert missing — cannot swap system audio source".to_string())?;
+
+    if let Some(old) = pipeline.by_name("system_audio_src") {
+        let _ = old.set_state(gst::State::Null);
+        if let (Some(src_pad), Some(sink_pad)) = (old.static_pad("src"), downstream.static_pad("sink")) {
+            let _ = src_pad.unlink(&sink_pad);
+        }
+        pipeline.remove(&old)
+            .map_err(|e| format!("Failed to remove old system audio source: {:?}", e))?;
+    }
+
+    pipeline.add(new_src)
+        .map_err(|e| format!("Failed to add replacement system audio source: {:?}", e))?;
+    new_src.link(&downstream)
+        .map_err(|e| format!("Failed to link replacement system audio source: {:?}", e))?;
+    Ok(())
+}
+
+// Bring a single audio source up to READY, which is where GstAudioBaseSrc opens
+// the endpoint — `gst_wasapi2_ring_buffer_post_open_error` fires on exactly this
+// transition. Opening the sources one at a time here, instead of letting the
+// pipeline's PLAYING transition activate them all at once, serializes the wasapi2
+// activations (two racing there is what made this fail intermittently) and pins
+// any failure to one branch while it is still cheap to unpick.
+//
+// A failed `set_state` only yields a bare `StateChangeError`; the useful text is
+// the element error it posted to the pipeline bus. Draining it here also stops it
+// leaking into a later `drain_bus_errors` as a stale, already-handled failure.
+fn open_audio_source(pipeline: &gst::Pipeline, el: &gst::Element) -> Result<(), String> {
+    match el.set_state(gst::State::Ready) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let detail = drain_bus_errors(pipeline);
+            let _ = el.set_state(gst::State::Null);
+            Err(format!(
+                "{:?}{}",
+                e,
+                if detail.is_empty() { " — no detail on bus".to_string() } else { detail }
+            ))
+        }
+    }
+}
+
 // Pop any queued error messages from the pipeline bus. Used when a synchronous
 // state-change call fails so the surfaced Tauri error includes the actual
 // upstream cause (which element / what went wrong) instead of the generic
@@ -847,17 +1045,55 @@ fn drain_bus_errors(pipeline: &gst::Pipeline) -> String {
         Some(gst::ClockTime::from_mseconds(100)),
         &[gst::MessageType::Error, gst::MessageType::Warning],
     ) {
-        if let gst::MessageView::Error(err) = msg.view() {
-            out.push_str(&format!(
-                " — {} from {:?}: {}  debug={:?}",
-                if msg.type_() == gst::MessageType::Error { "error" } else { "warning" },
-                err.src().map(|s| s.path_string().to_string()),
-                err.error(),
-                err.debug(),
-            ));
-        }
+        // Both arms have to be handled: matching only Error would still *pop*
+        // every warning and then throw it away, and the audio fallbacks below
+        // decide what to disable by reading this string.
+        let (kind, src, error, debug) = match msg.view() {
+            gst::MessageView::Error(e) => (
+                "error",
+                e.src().map(|s| s.path_string().to_string()),
+                e.error().to_string(),
+                e.debug(),
+            ),
+            gst::MessageView::Warning(w) => (
+                "warning",
+                w.src().map(|s| s.path_string().to_string()),
+                w.error().to_string(),
+                w.debug(),
+            ),
+            _ => continue,
+        };
+        out.push_str(&format!(
+            " — {} from {:?}: {}  debug={:?}",
+            kind, src, error, debug,
+        ));
     }
     out
+}
+
+// Element names that identify the audio path in a bus error string. Deliberately
+// excludes bare "audioconvert"/"audioresample": those are substrings of
+// `mic_audioconvert` and of the recording branch's elements, so matching them
+// would misattribute unrelated failures to audio.
+const AUDIO_ERROR_MARKERS: [&str; 8] = [
+    "system_audio_src", "mic_src", "sys_audio_caps", "audio_mixer",
+    "audio_tee", "opusenc", "rtpopuspay", "audio_rtp_sink",
+];
+
+// One attempt at PLAYING: kick the async transition, then block on the result.
+// Both failure paths fold the drained bus text in, so the caller sees which
+// element actually failed rather than a bare `StateChangeError`.
+fn bring_pipeline_to_playing(pipeline: &gst::Pipeline) -> Result<(), String> {
+    pipeline.set_state(gst::State::Playing)
+        .map_err(|e| format!("Failed to start pipeline: {:?}{}", e, drain_bus_errors(pipeline)))?;
+
+    let (state_result, current_state, pending_state) =
+        pipeline.state(gst::ClockTime::from_seconds(5));
+    state_result
+        .map_err(|e| format!("Failed to get pipeline state: {:?}{}", e, drain_bus_errors(pipeline)))?;
+
+    println!("Pipeline current state: {:?}, pending: {:?}", current_state, pending_state);
+    Ok(())
 }
 
 fn bus_call(_bus: &gst::Bus, msg: &gst::Message) -> glib::ControlFlow {
@@ -1050,7 +1286,7 @@ pub fn create_gstreamer_pipeline(
     mic_enabled: bool,
     mic_device_id: Option<String>,
     mic_initially_muted: bool,
-) -> Result<(), String> {
+) -> Result<StreamStatus, String> {
     // Initialize GStreamer if not already initialized
     if let Err(e) = init() {
         return Err(e);
@@ -1127,7 +1363,9 @@ pub fn create_gstreamer_pipeline(
         .build()
         .map_err(|_| "Failed to create udpsrc element".to_string())?;
 
-    let audio_src = create_system_audio_source(process_pid)?;
+    // `sys_audio_mode` is what we *asked* for; the pre-open stage further down
+    // may downgrade it if the endpoint refuses to open.
+    let (audio_src, mut sys_audio_mode) = create_system_audio_source(process_pid)?;
 
     let audioconvert = gst::ElementFactory::make("audioconvert")
         .name("audioconvert")
@@ -1222,31 +1460,23 @@ pub fn create_gstreamer_pipeline(
     // System audio goes to mixer sink_0; mic goes through a valve (for live
     // mute) into sink_1. When no mic device is supplied, the original
     // single-source audio chain is used unchanged.
-    let mic_branch = if let Some(ref dev_id) = mic_device_id {
-        let mic_src = create_mic_source(dev_id)?;
-        let mic_audioconvert = gst::ElementFactory::make("audioconvert")
-            .name("mic_audioconvert")
-            .build()
-            .map_err(|_| "Failed to create mic audioconvert".to_string())?;
-        let mic_audioresample = gst::ElementFactory::make("audioresample")
-            .name("mic_audioresample")
-            .build()
-            .map_err(|_| "Failed to create mic audioresample".to_string())?;
-        let mic_caps = gst::ElementFactory::make("capsfilter")
-            .name("mic_caps")
-            .build()
-            .map_err(|_| "Failed to create mic capsfilter".to_string())?;
-        mic_caps.set_property("caps", &mixer_in_caps);
-        let mic_valve = gst::ElementFactory::make("valve")
-            .name("mic_valve")
-            .build()
-            .map_err(|_| "Failed to create mic valve element".to_string())?;
-        // drop=true → discards buffers immediately (mute). The mic branch is
-        // always wired into the mixer; the valve gates flow at runtime.
-        mic_valve.set_property("drop", mic_initially_muted || !mic_enabled);
-        Some((mic_src, mic_audioconvert, mic_audioresample, mic_caps, mic_valve))
-    } else {
-        None
+    // A mic that can't be built is never fatal — the user still gets their
+    // stream, just without a mic. `mic_failed` is reported back to the UI.
+    let mut mic_failed = false;
+    let mic_branch = match mic_device_id.as_ref() {
+        None => None,
+        Some(dev_id) => {
+            match create_mic_source(dev_id).and_then(|src| {
+                build_mic_branch(src, &mixer_in_caps, mic_enabled, mic_initially_muted)
+            }) {
+                Ok(branch) => Some(branch),
+                Err(e) => {
+                    eprintln!("[Audio] Mic unavailable ({}); streaming without it", e);
+                    mic_failed = true;
+                    None
+                }
+            }
+        }
     };
 
     let sys_audio_caps = gst::ElementFactory::make("capsfilter")
@@ -1256,8 +1486,9 @@ pub fn create_gstreamer_pipeline(
     // When mixing we need a fully-specified format; without a mixer the
     // existing opus_capsfilter downstream is sufficient and we keep the lighter
     // rate/channels-only caps so audioconvert/audioresample can pick a format
-    // that opusenc happily ingests.
-    if mic_device_id.is_some() {
+    // that opusenc happily ingests. Keyed off `mic_branch`, not the requested
+    // device id — a mic that failed to build leaves no mixer to feed.
+    if mic_branch.is_some() {
         sys_audio_caps.set_property("caps", &mixer_in_caps);
     } else {
         sys_audio_caps.set_property("caps", &opus_in_caps);
@@ -1737,10 +1968,7 @@ pub fn create_gstreamer_pipeline(
     // `sent-rb-*` fields update only when an RR is received, so a frozen
     // round-trip / fractionlost across multiple polls means feedback is silent.)
 
-    // Set up bus watching
-    let bus = pipeline.bus().unwrap();
-    let bus_watch_guard = bus.add_watch(bus_call)
-        .map_err(|_| "Failed to add bus watch".to_string())?;
+    // (The bus watch is installed after the pipeline reaches PLAYING — see below.)
 
     // Share a single GSocket between rtcp_src and rtcp_sink so RTCP egresses
     // from the same port we listen on. Required for mediasoup PlainTransport
@@ -1760,29 +1988,104 @@ pub fn create_gstreamer_pipeline(
     audio_rtcp_sink.set_property_from_value("socket", &audio_rtcp_socket_value);
     audio_rtcp_sink.set_property("close-socket", false);
 
-    // Start playing
-    let state_change_result = pipeline.set_state(gst::State::Playing);
-    match state_change_result {
-        Ok(_) => println!("Pipeline state change initiated successfully"),
-        Err(e) => {
-            let extra = drain_bus_errors(&pipeline);
-            return Err(format!("Failed to start pipeline: {:?}{}", e, extra));
+    // Open the audio endpoints one at a time, before the pipeline transition
+    // would open them all at once. See `open_audio_source` for why serializing
+    // matters; the payoff here is that each failure is attributable to a single
+    // branch and can be undone locally while nothing is running yet.
+    if let Some(mic) = pipeline.by_name("mic_src") {
+        if let Err(e) = open_audio_source(&pipeline, &mic) {
+            eprintln!("[Audio] Mic failed to open ({}); dropping the mic branch", e);
+            disable_mic_branch(&pipeline);
+            mic_failed = true;
         }
     }
 
-    // Wait for state change to complete with timeout
-    let (state_result, current_state, pending_state) = pipeline.state(gst::ClockTime::from_seconds(5));
-    match state_result {
-        Ok(_) => {
-            println!("Pipeline current state: {:?}, pending: {:?}", current_state, pending_state);
+    if let Some(sys) = pipeline.by_name("system_audio_src") {
+        if let Err(e) = open_audio_source(&pipeline, &sys) {
+            eprintln!("[Audio] System audio failed to open ({})", e);
+
+            // Nothing below uses `?` — every step is best-effort. If they all
+            // fail, the graph still holds a dead source, the PLAYING attempt
+            // further down fails against it, and the recovery net strips audio
+            // out entirely. That is still a live stream.
+            let attempt = |new_src: gst::Element| -> Result<(), String> {
+                swap_system_audio_src(&pipeline, &new_src)?;
+                open_audio_source(&pipeline, &new_src)
+            };
+
+            // Per-process loopback is the fragile one: it needs Win11 20348+ and
+            // is refused for elevated / protected game processes. Whole-system
+            // loopback usually still works, so try that before giving up on real
+            // audio. Where the pid was never applied the retry would be
+            // identical, so that case goes straight to silence.
+            let mut recovered = false;
+            if sys_audio_mode == SysAudioMode::ProcessLoopback {
+                match create_system_audio_source(None).and_then(|(el, _)| attempt(el)) {
+                    Ok(()) => {
+                        eprintln!("[Audio] Fell back to whole-system loopback");
+                        sys_audio_mode = SysAudioMode::SystemLoopback;
+                        recovered = true;
+                    }
+                    Err(e2) => eprintln!("[Audio] Whole-system loopback also failed ({})", e2),
+                }
+            }
+
+            if !recovered {
+                match create_silent_audio_source().and_then(attempt) {
+                    Ok(()) => {
+                        eprintln!("[Audio] No capturable system audio; substituting silence");
+                        sys_audio_mode = SysAudioMode::Silence;
+                    }
+                    Err(e2) => eprintln!("[Audio] Silent substitute failed too ({}); audio will be dropped", e2),
+                }
+            }
         }
-        Err(e) => {
-            let extra = drain_bus_errors(&pipeline);
-            return Err(format!("Failed to get pipeline state: {:?}{}", e, extra));
+    }
+
+    // Start playing. If it still fails inside the audio path — something the
+    // per-source open didn't predict, e.g. a source that opens fine at READY but
+    // fails negotiation in PLAYING — peel the audio back rather than refusing to
+    // go live: first just the mic, then the whole audio sub-graph.
+    let mut audio_chain_disabled = false;
+    if let Err(first) = bring_pipeline_to_playing(&pipeline) {
+        if !AUDIO_ERROR_MARKERS.iter().any(|m| first.contains(m)) {
+            return Err(first);
+        }
+        eprintln!("[Audio] Startup failed in the audio path: {}", first);
+
+        let mut recovered = false;
+        if disable_mic_branch(&pipeline) {
+            match bring_pipeline_to_playing(&pipeline) {
+                Ok(()) => {
+                    eprintln!("[Audio] Recovered by dropping the mic branch");
+                    mic_failed = true;
+                    recovered = true;
+                }
+                Err(e) => eprintln!("[Audio] Still failing without the mic: {}", e),
+            }
+        }
+
+        if !recovered {
+            if !disable_audio_chain(&pipeline) {
+                return Err(first);
+            }
+            bring_pipeline_to_playing(&pipeline).map_err(|e| {
+                format!("{}  (after disabling audio following: {})", e, first)
+            })?;
+            eprintln!("[Audio] Recovered by disabling audio entirely; video continues");
+            audio_chain_disabled = true;
         }
     }
 
     println!("GStreamer pipeline started successfully");
+
+    // Bus watch goes up only now: before this point `drain_bus_errors` needs to
+    // own the queue so the fallbacks above can read the actual failure instead of
+    // racing the watch for it. Messages queued in the meantime aren't lost —
+    // they dispatch once the main loop below starts.
+    let bus = pipeline.bus().unwrap();
+    let bus_watch_guard = bus.add_watch(bus_call)
+        .map_err(|_| "Failed to add bus watch".to_string())?;
 
     // Create and start a main loop to process bus messages
     let main_loop = glib::MainLoop::new(None, false);
@@ -1867,7 +2170,64 @@ pub fn create_gstreamer_pipeline(
     state.stats_stop = Some(stats_stop);
     state.src_factory_name = src_factory_name;
 
-    Ok(())
+    Ok(build_stream_status(
+        sys_audio_mode,
+        audio_chain_disabled,
+        mic_device_id.is_some(),
+        mic_failed,
+        process_pid.filter(|&p| p != 0).is_some(),
+    ))
+}
+
+// Turn the outcome of the audio fallbacks into something the UI can show. Every
+// notice here is non-fatal by construction — the stream is live either way.
+fn build_stream_status(
+    sys_audio_mode: SysAudioMode,
+    audio_chain_disabled: bool,
+    mic_requested: bool,
+    mic_failed: bool,
+    pid_requested: bool,
+) -> StreamStatus {
+    let mic = match (mic_requested, mic_failed || audio_chain_disabled) {
+        (false, _) => "off",
+        (true, true) => "failed",
+        (true, false) => "on",
+    };
+
+    if audio_chain_disabled {
+        return StreamStatus {
+            system_audio: "none",
+            mic,
+            notice: Some("Audio couldn't be started — you're live with video only.".to_string()),
+        };
+    }
+
+    let mut notices: Vec<&str> = Vec::new();
+    let system_audio = match sys_audio_mode {
+        SysAudioMode::ProcessLoopback => "process",
+        SysAudioMode::SystemLoopback => {
+            // Only worth mentioning if we were asked for app-scoped audio and
+            // had to widen it; a monitor capture never asked in the first place.
+            if pid_requested {
+                notices.push("Couldn't capture audio from that app specifically — streaming your whole system's audio instead.");
+            }
+            "system"
+        }
+        SysAudioMode::Silence => {
+            notices.push("System audio couldn't be captured on this PC. You're live with video.");
+            "silence"
+        }
+    };
+
+    if mic_failed {
+        notices.push("Your microphone couldn't be opened — streaming without mic.");
+    }
+
+    StreamStatus {
+        system_audio,
+        mic,
+        notice: if notices.is_empty() { None } else { Some(notices.join(" ")) },
+    }
 }
 
 // Cleanup function
@@ -1921,7 +2281,7 @@ pub fn start_streaming(
     mic_enabled: bool,
     mic_device_id: Option<String>,
     mic_initially_muted: bool,
-) -> Result<String, String> {
+) -> Result<StreamStatus, String> {
     init()?;
 
     println!(
@@ -1931,14 +2291,15 @@ pub fn start_streaming(
         monitor_index, mic_enabled, mic_device_id, mic_initially_muted,
     );
 
-    create_gstreamer_pipeline(
+    let status = create_gstreamer_pipeline(
         &video_host, video_rtp_port, video_rtcp_port,
         &audio_host, audio_rtp_port, audio_rtcp_port,
         window_handle, process_pid, monitor_index,
         mic_enabled, mic_device_id, mic_initially_muted,
     )?;
 
-    Ok("Streaming started successfully".to_string())
+    println!("[Audio] Stream status: {:?}", status);
+    Ok(status)
 }
 
 // Stop streaming function
