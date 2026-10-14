@@ -29,10 +29,6 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: Install pkg-config
-        shell: pwsh
-        run: choco install -y --no-progress pkgconfiglite
-
       - name: Download GStreamer MSIs
         shell: pwsh
         run: |
@@ -98,6 +94,19 @@ jobs:
           "$env:GSTREAMER_ROOT\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "PKG_CONFIG_PATH=$env:GSTREAMER_ROOT\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GSTREAMER_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # GStreamer's MSVC install ships its own pkg-config.exe in bin\ (now on PATH).
+      # Fall back to Chocolatey only if it's missing — the choco feed is flaky (406s).
+      - name: Verify pkg-config
+        shell: pwsh
+        run: |
+          if (-not (Get-Command pkg-config -ErrorAction SilentlyContinue)) {
+            Write-Host "pkg-config not found in GStreamer bin, installing via choco..."
+            choco install -y --no-progress pkgconfiglite
+            if ($LASTEXITCODE -ne 0) { throw "pkg-config install failed" }
+          }
+          (Get-Command pkg-config).Source
+          pkg-config --modversion gstreamer-1.0
 
       - name: Stage GStreamer DLLs for build.rs and bundler
         shell: pwsh
