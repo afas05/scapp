@@ -12,6 +12,12 @@ enum Method: uint16 {
     ViewerCount = 8,
     StreamEnded = 9,
     CreateProducerPlainTransport = 10,
+    ClipUpdated = 11,
+    PostUpdated = 12,
+    ViewerJoined = 13,
+    ViewerLeft = 14,
+    ChatMessage = 15,
+    ChatDeleted = 16,
 }
 
 // --- CreateProducerTransport ---
@@ -44,7 +50,12 @@ table ProduceResponse {
 }
 
 // --- CreateConsumerTransport ---
-table CreateConsumerTransportRequest {}
+// producer_id: the broadcast this transport will consume. Signaling routes the
+// transport to the media node that broadcast lives on (one node per broadcast,
+// no pipes between nodes). Appended, so clients without it still parse.
+table CreateConsumerTransportRequest {
+    producer_id: string;
+}
 
 table CreateConsumerTransportResponse {
     id: string;
@@ -81,12 +92,43 @@ table ResumeResponse {}
 // --- ProducerClosed (notification, no response) ---
 table ProducerClosedRequest {}
 
-// --- ViewerCount (server -> client notification) ---
+// --- ViewerCount (server → client notification) ---
 table ViewerCountRequest {
     count: int32;
 }
 
-// --- StreamEnded (server -> client notification) ---
+// --- ViewerJoined / ViewerLeft (server → client notifications) ---
+// The live audience of a broadcast, as deltas: the watch page loads the current
+// list once over HTTP, then applies these. Sent by the video stream only, and per
+// person, not per connection: a viewer with two tabs joins once and leaves when
+// the last one closes.
+table ViewerJoinedRequest {
+    user_id: uint32;
+    name: string;
+}
+
+table ViewerLeftRequest {
+    user_id: uint32;
+}
+
+// --- ChatMessage / ChatDeleted (server → client notifications) ---
+// Watch page chat. Laravel saves each message and PUBLISHes it on ss:events; the
+// SFU fans it out to the broadcaster's audience. Late joiners load the history
+// over HTTP once, then apply these.
+table ChatMessageRequest {
+    id: uint64;
+    user_id: uint32;
+    name: string;
+    body: string;
+    sent_at: uint64;     // epoch milliseconds
+}
+
+// Messages removed by a moderator (one delete, or a ban clearing a user's messages).
+table ChatDeletedRequest {
+    ids: [uint64];
+}
+
+// --- StreamEnded (server → client notification) ---
 table StreamEndedRequest {}
 
 // --- CreateProducerPlainTransport (PlainTransport with comedia=true; no connect step) ---
@@ -99,4 +141,45 @@ table CreateProducerPlainTransportResponse {
     ip: string;
     port: uint16;        // RTP port the client must send to
     rtcp_port: uint16;   // RTCP port (rtcpMux=false)
+}
+
+// --- ClipUpdated (server → client notification) ---
+// Pushed whenever a VideoSource or a VideoClip row changes state, so the clip
+// studio never polls. Both row types share this message: `clip_id` names one or
+// the other (ids are distinct uuids), a source fills only the fetch_* half and a
+// clip only the state half, and the client applies whichever half it asked for.
+// Always a full snapshot of these fields, never a delta — a cleared error must
+// arrive as "" rather than as an absent field, or the client would keep showing
+// the stale one after a re-render clears it.
+table ClipUpdatedRequest {
+    clip_id: string;
+    fetch_state: string;    // pending | fetching | ready | failed
+    fetch_error: string;
+    source_title: string;
+    duration: float32;
+    width: int32;
+    height: int32;
+    state: string;          // draft | queued | processing | done | failed
+    output_bytes: int64;
+    error_code: string;
+    error: string;
+}
+
+// --- PostUpdated (server → client notification) ---
+// Pushed whenever any PostTarget of a post changes state. Carries the whole
+// target set, because the UI renders the post as a unit.
+table PostTargetState {
+    target_id: string;
+    provider: string;       // youtube | tiktok | instagram
+    state: string;          // queued | processing | done | failed
+    remote_id: string;
+    remote_url: string;
+    error_code: string;
+    error: string;
+}
+
+table PostUpdatedRequest {
+    post_id: string;
+    state: string;          // processing | done | failed (derived from the targets)
+    targets: [PostTargetState];
 }

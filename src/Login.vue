@@ -30,7 +30,7 @@ async function loginAction() {
     }
 
     const userStore = useUserStore();
-    await userStore.login(data.user.name, data.access_token);
+    await userStore.login(data.user.name, data.access_token, data.user.id);
     // Login response has no plan; fetch it so the first recording gates correctly.
     await userStore.refreshPlan();
     await router.replace('/start')

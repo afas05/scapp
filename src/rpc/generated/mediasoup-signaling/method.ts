@@ -11,5 +11,11 @@ export enum Method {
   ProducerClosed = 7,
   ViewerCount = 8,
   StreamEnded = 9,
-  CreateProducerPlainTransport = 10
+  CreateProducerPlainTransport = 10,
+  ClipUpdated = 11,
+  PostUpdated = 12,
+  ViewerJoined = 13,
+  ViewerLeft = 14,
+  ChatMessage = 15,
+  ChatDeleted = 16
 }

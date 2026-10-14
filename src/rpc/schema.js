@@ -20,6 +20,8 @@ import {
     StreamEndedRequest,
     CreateProducerPlainTransportRequest,
     CreateProducerPlainTransportResponse,
+    ChatMessageRequest,
+    ChatDeletedRequest,
 } from './generated/mediasoup-signaling_generated';
 
 export { Method };
@@ -36,4 +38,6 @@ export const schema = defineSchema({
     [Method.ViewerCount]: { Req: ViewerCountRequest },
     [Method.StreamEnded]: { Req: StreamEndedRequest },
     [Method.CreateProducerPlainTransport]: { Req: CreateProducerPlainTransportRequest, Res: CreateProducerPlainTransportResponse },
+    [Method.ChatMessage]: { Req: ChatMessageRequest },
+    [Method.ChatDeleted]: { Req: ChatDeletedRequest },
 });

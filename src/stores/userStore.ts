@@ -21,9 +21,22 @@ function extractPlan(data: any): number | undefined {
     return undefined
 }
 
+// The user id (the broadcaster id the chat ban endpoints take), as a positive
+// integer. Accepts a numeric string too, since chat compares ids strictly.
+function toUserId(value: unknown): number | undefined {
+    const id = typeof value === 'string' ? Number(value) : value
+    return typeof id === 'number' && Number.isInteger(id) && id > 0 ? id : undefined
+}
+
+function extractUserId(data: any): number | undefined {
+    return toUserId(data?.id) ?? toUserId(data?.user?.id)
+}
+
 export const useUserStore = defineStore('user', {
     state: () => ({
         name: '',
+        // users.id; the broadcaster id for chat moderation. 0 = unknown.
+        userId: 0,
         sessionHash: '',
         isLoggedIn: false,
         hydrating: true,
@@ -39,12 +52,14 @@ export const useUserStore = defineStore('user', {
         plan: (state) => state.subscription_tier_id,
     },
     actions: {
-        async login(name: string, sessionHash: string) {
+        async login(name: string, sessionHash: string, userId?: unknown) {
             this.name = name
+            this.userId = toUserId(userId) ?? 0
             this.sessionHash = sessionHash
             this.isLoggedIn = true
             const store = await getStore()
             await store.set('name', name)
+            await store.set('userId', this.userId)
             await store.set('sessionHash', sessionHash)
             await store.save()
         },
@@ -56,8 +71,11 @@ export const useUserStore = defineStore('user', {
             try {
                 const response = await useHttp('GET', 'user', undefined, this.sessionHash)
                 if (response.ok) {
-                    const plan = extractPlan(await response.json())
-                if (plan !== undefined) this.subscription_tier_id = plan
+                    const data = await response.json()
+                    const plan = extractPlan(data)
+                    if (plan !== undefined) this.subscription_tier_id = plan
+                    const id = extractUserId(data)
+                    if (id !== undefined) this.userId = id
                 }
             } catch (err) {
                 console.warn('[userStore] refreshPlan failed:', err)
@@ -65,12 +83,14 @@ export const useUserStore = defineStore('user', {
         },
         async logout() {
             this.name = ''
+            this.userId = 0
             this.sessionHash = ''
             this.isLoggedIn = false
             this.subscription_tier_id = 1
             try {
                 const store = await getStore()
                 await store.delete('name')
+                await store.delete('userId')
                 await store.delete('sessionHash')
                 await store.save()
             } catch (err) {
@@ -86,6 +106,8 @@ export const useUserStore = defineStore('user', {
                 if (!name || !sessionHash) {
                     return
                 }
+                // Only trusted alongside a stored session; /api/user refreshes it below.
+                this.userId = toUserId(await store.get('userId')) ?? 0
                 try {
                     const response = await useHttp('GET', 'user', undefined, sessionHash)
                     console.log('[userStore] hydrate: /api/user status=', response.status)
@@ -94,7 +116,9 @@ export const useUserStore = defineStore('user', {
                         this.sessionHash = sessionHash
                         this.isLoggedIn = true
                         try {
-                            this.subscription_tier_id = extractPlan(await response.json()) ?? this.subscription_tier_id
+                            const data = await response.json()
+                            this.subscription_tier_id = extractPlan(data) ?? this.subscription_tier_id
+                            this.userId = extractUserId(data) ?? this.userId
                         } catch { /* keep default plan */ }
                     } else if (response.status === 401 || response.status === 403) {
                         console.warn('[userStore] Token rejected by server (', response.status, '), clearing credentials')

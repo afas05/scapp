@@ -14,8 +14,12 @@ import { loadConfig } from './config.js';
 
 import { openPath } from '@tauri-apps/plugin-opener';
 import { join as pathJoin } from '@tauri-apps/api/path';
+import { getCurrentWindow, currentMonitor } from '@tauri-apps/api/window';
+import { LogicalSize } from '@tauri-apps/api/dpi';
 import IdleHome, { type IdleSource } from './components/idle/IdleHome.vue';
 import LiveDashboard from './components/live/LiveDashboard.vue';
+import ChatPanel from './components/live/ChatPanel.vue';
+import { useChat, type ChatMessage } from './composables/useChat';
 import Connecting from './components/shared/Connecting.vue';
 import WindowPicker from './components/WindowPicker.vue';
 import SettingsModal from './components/shared/SettingsModal.vue';
@@ -47,6 +51,7 @@ interface MicDevice {
 const router = useRouter();
 const userStore = useUserStore();
 const mediaSoup = useMediaSoup();
+const chat = useChat();
 
 type Phase = 'idle' | 'connecting' | 'live';
 const phase = ref<Phase>('idle');
@@ -207,29 +212,77 @@ mediaSoup.on('producerCreated', (id: string, session: string) => {
   streamStartedAt.value = Date.now();
   peakViewers.value = 0;
   safeInvoke('discord_set_streaming', { producerId: id });
+  chat.open(id);
+  growForChat();
 });
 
-mediaSoup.on('producerClosed', () => {
-  console.log('[MediaSoup] Producer closed');
-  finalizeSession();
-  phase.value = 'idle';
-  noticeMessage.value = '';
-  producerId.value = '';
-  userSession.value = '';
-  safeInvoke('discord_clear');
-});
+// Chat pushes arrive from the moment the socket opens; useChat holds them until
+// the history for this broadcast has loaded.
+mediaSoup.on('chatMessage', (message: ChatMessage) => chat.onPush({ message }));
+mediaSoup.on('chatDeleted', (ids: number[]) => chat.onPush({ deleted: ids }));
 
+// The chat column needs room of its own: widen the window by its width while live
+// (within the monitor's work area) and take that width back on stop. Grow and
+// restore run one after another on a queue, so a stop that lands mid-grow still
+// undoes it. Restore shrinks by what was added rather than snapping back to the
+// pre-live size, which keeps any resize the user made while live.
+const CHAT_WIDTH = 280;
+let grownBy = 0;
+let windowOps: Promise<void> = Promise.resolve();
+
+function queueWindowOp(op: () => Promise<void>) {
+  windowOps = windowOps.then(op).catch((e) => console.warn('[Chat] window resize failed:', e));
+}
+
+function growForChat() {
+  queueWindowOp(async () => {
+    const win = getCurrentWindow();
+    if (grownBy || await win.isMaximized()) return;
+    const sf = await win.scaleFactor();
+    const size = (await win.innerSize()).toLogical(sf);
+    const monitor = await currentMonitor();
+    const maxWidth = monitor ? monitor.workArea.size.toLogical(monitor.scaleFactor).width - 16 : Infinity;
+    const width = Math.min(size.width + CHAT_WIDTH, maxWidth);
+    if (width <= size.width) return;
+    grownBy = width - size.width;
+    await win.setSize(new LogicalSize(width, size.height));
+    // Growing to the right can push the window off-screen; bring it back.
+    if (monitor) {
+      const pos = await win.outerPosition();
+      const outer = await win.outerSize();
+      const right = monitor.workArea.position.x + monitor.workArea.size.width;
+      if (pos.x + outer.width > right) await win.center();
+    }
+  });
+}
+
+function restoreWindowSize() {
+  queueWindowOp(async () => {
+    if (!grownBy) return;
+    const by = grownBy;
+    grownBy = 0;
+    const win = getCurrentWindow();
+    if (await win.isMaximized()) return;
+    const sf = await win.scaleFactor();
+    const size = (await win.innerSize()).toLogical(sf);
+    await win.setSize(new LogicalSize(Math.max(400, size.width - by), size.height));
+  });
+}
 mediaSoup.on('viewerCount', (count: number) => {
   viewerCount.value = count;
   if (count > peakViewers.value) peakViewers.value = count;
 });
 
-mediaSoup.on('streamEnded', () => {
-  console.log('[MediaSoup] Stream ended by server');
-  finalizeSession();
-  phase.value = 'idle';
-  noticeMessage.value = '';
-  safeInvoke('discord_clear');
+// The server ended the stream (moderator, lost media node) or the socket dropped.
+// Tear down like a user stop, or GStreamer keeps sending RTP to a closed port and
+// the next Start opens a second socket over this one.
+mediaSoup.on('streamEnded', async (reason: 'ended' | 'disconnected') => {
+  console.log('[MediaSoup] Stream ended by server:', reason);
+  await stopStream();
+  errorMessage.value = '';
+  noticeMessage.value = reason === 'disconnected'
+    ? 'Lost connection to the server. The stream was stopped.'
+    : 'The stream was ended by the server.';
 });
 
 function finalizeSession() {
@@ -268,10 +321,11 @@ async function startStream() {
     }
     if (status?.mic === 'failed') micOn.value = false;
   } catch (err: any) {
+    // Cancelled by a teardown (user Stop or server end), which owns the UI reset.
+    if (err?.name === 'AbortError') return;
     console.error('[MediaSoup] Failed to start stream:', err);
     errorMessage.value = `Failed to start stream: ${err?.message ?? err}`;
-    phase.value = 'idle';
-    try { await mediaSoup.destroy(); } catch {}
+    await stopStream();
   }
 }
 
@@ -306,6 +360,7 @@ async function onLiveSelectSource(id: number) {
   }
 }
 
+// The one teardown path: user Stop, failed start and server end all land here.
 async function stopStream() {
   try {
     await mediaSoup.destroy();
@@ -313,6 +368,8 @@ async function stopStream() {
     console.error('[MediaSoup] Error during teardown:', err);
   }
   finalizeSession();
+  chat.close();
+  restoreWindowSize();
   phase.value = 'idle';
   producerId.value = '';
   userSession.value = '';
@@ -420,6 +477,8 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   stopPreviewTimer();
+  chat.close();
+  restoreWindowSize();
   if (phase.value === 'live' || phase.value === 'connecting') {
     mediaSoup.destroy().catch(() => {});
   }
@@ -460,39 +519,42 @@ onBeforeUnmount(() => {
       @open-editor="router.push('/editor')"
     />
 
-    <LiveDashboard
-      v-else-if="phase === 'live'"
-      :sources="sources"
-      :selected-id="selectedId"
-      :camera-on="cameraOn"
-      :mic-on="micOn"
-      :mic-device="micDevice"
-      :available-mics="availableMics"
-      :viewer-count="viewerCount"
-      :share-url="shareUrl"
-      :preview-frame="previewFrame"
-      :switching-id="switchingSourceId"
-      @select="onLiveSelectSource"
-      @toggle-mic="onLiveToggleMic"
-      @stop="stopStream"
-      @open-settings="showSettings = true"
-      @start-recording="onStartRecording"
-      @stop-recording="onStopRecording"
-    />
+    <div v-else-if="phase === 'live'" class="live-row">
+      <div class="live-main">
+        <LiveDashboard
+          :sources="sources"
+          :selected-id="selectedId"
+          :camera-on="cameraOn"
+          :mic-on="micOn"
+          :mic-device="micDevice"
+          :available-mics="availableMics"
+          :viewer-count="viewerCount"
+          :share-url="shareUrl"
+          :preview-frame="previewFrame"
+          :switching-id="switchingSourceId"
+          @select="onLiveSelectSource"
+          @toggle-mic="onLiveToggleMic"
+          @stop="stopStream"
+          @open-settings="showSettings = true"
+          @start-recording="onStartRecording"
+          @stop-recording="onStopRecording"
+        />
+        <a
+          v-if="producerId"
+          class="open-stream"
+          @click.prevent="openStream"
+          :href="'https://streamsnipe.live?streamId=' + producerId"
+        >
+          Open viewer ↗
+        </a>
+      </div>
+      <ChatPanel :chat="chat" />
+    </div>
 
     <Connecting v-if="phase === 'connecting'" />
 
     <WindowPicker v-model="showPicker" @selected="onPickerSelected" />
     <SettingsModal v-model="showSettings" />
-
-    <a
-      v-if="phase === 'live' && producerId"
-      class="open-stream"
-      @click.prevent="openStream"
-      :href="'https://streamsnipe.live?streamId=' + producerId"
-    >
-      Open viewer ↗
-    </a>
   </div>
 </template>
 
@@ -546,6 +608,17 @@ onBeforeUnmount(() => {
   font-size: 14px;
   line-height: 1;
   padding: 0;
+}
+.live-row {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+.live-main {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
 }
 .open-stream {
   position: absolute;
