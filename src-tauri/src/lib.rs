@@ -45,6 +45,7 @@ async fn start_stream(
     mic_enabled: Option<bool>,
     mic_device_id: Option<String>,
     mic_initially_muted: Option<bool>,
+    quality: gstreamer::StreamQuality,
 ) -> Result<gstreamer::StreamStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         gstreamer::start_streaming(
@@ -60,6 +61,7 @@ async fn start_stream(
             mic_enabled.unwrap_or(false),
             mic_device_id,
             mic_initially_muted.unwrap_or(false),
+            quality,
         )
     })
     .await
@@ -73,6 +75,13 @@ async fn stop_stream() -> Result<(), String> {
     })
     .await
     .map_err(|e| format!("Failed to join task: {}", e))?
+}
+
+#[tauri::command]
+async fn set_stream_quality(quality: gstreamer::StreamQuality) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gstreamer::set_stream_quality(quality))
+        .await
+        .map_err(|e| format!("Failed to join task: {}", e))?
 }
 
 #[tauri::command]
@@ -288,7 +297,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![start_stream, stop_stream, switch_source, list_windows, list_monitors, list_audio_inputs, set_mic_muted, get_preview_frame, start_recording, stop_recording, list_recordings, export_clip, autopost_submit, discord_set_streaming, discord_clear])
+        .invoke_handler(tauri::generate_handler![start_stream, stop_stream, set_stream_quality, switch_source, list_windows, list_monitors, list_audio_inputs, set_mic_muted, get_preview_frame, start_recording, stop_recording, list_recordings, export_clip, autopost_submit, discord_set_streaming, discord_clear])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

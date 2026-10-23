@@ -346,13 +346,13 @@ pub fn init() -> Result<(), String> {
 //   zero-latency:  zerolatency (CUDA, bool) vs zero-reorder-delay (D3D11, bool)
 // Types and enum values match. We probe property availability with
 // `find_property` so the same helper works for either encoder.
-fn configure_nvenc(enc: &gst::Element) {
-    enc.set_property("bitrate", 20000u32); // 20 Mbps target (kbps)
-    // 20 Mbps × 0.4 s = 8000 kbits — preserves the 400 ms VBV window the
-    // original x264 config used to bound per-frame size variance.
-    enc.set_property("vbv-buffer-size", 8000u32);
+fn configure_nvenc(enc: &gst::Element, bitrate_kbps: u32, gop: u32) {
+    enc.set_property("bitrate", bitrate_kbps);
+    // bitrate × 0.4 s — preserves the 400 ms VBV window the original x264
+    // config used to bound per-frame size variance.
+    enc.set_property("vbv-buffer-size", vbv_kbits(bitrate_kbps));
     enc.set_property_from_str("preset", "low-latency-hp");
-    enc.set_property("gop-size", 120i32); // 2 s GoP at 60 fps; i32 on NVENC
+    enc.set_property("gop-size", gop as i32); // i32 on NVENC
     enc.set_property("b-adapt", false);
     enc.set_property("aud", false);
 
@@ -375,28 +375,64 @@ fn configure_nvenc(enc: &gst::Element) {
     }
 }
 
-fn configure_encoder(enc: &gst::Element) {
+fn vbv_kbits(bitrate_kbps: u32) -> u32 {
+    bitrate_kbps * 2 / 5
+}
+
+// 2 s GoP at the stream's frame rate.
+fn stream_gop(quality: StreamQuality) -> u32 {
+    (quality.fps * 2).max(1) as u32
+}
+
+// Keyframe interval under whichever name the encoder uses (see configure_encoder).
+fn set_encoder_gop(enc: &gst::Element, gop: u32) {
+    if enc.find_property("gop-size").is_some() {
+        enc.set_property("gop-size", gop as i32); // i32 on NVENC
+    } else if enc.find_property("keyframe-period").is_some() {
+        enc.set_property("keyframe-period", gop);
+    } else if enc.find_property("key-int-max").is_some() {
+        enc.set_property("key-int-max", gop);
+    }
+}
+
+// Recording and clip export encode from the raw capture tee and aren't limited
+// by the broadcast quality; they keep the original 20 Mbps / 2 s @ 60 fps.
+const ARCHIVE_BITRATE_KBPS: u32 = 20000;
+const ARCHIVE_GOP: u32 = 120;
+
+// Broadcast quality preset, chosen by the frontend from the server's HD books
+// (src/lib/streamQuality.ts). Applied at pipeline build and by set_stream_quality.
+#[derive(serde::Deserialize, Debug, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamQuality {
+    pub width: i32,
+    pub height: i32,
+    pub fps: i32,
+    pub bitrate_kbps: u32,
+}
+
+fn configure_encoder(enc: &gst::Element, bitrate_kbps: u32, gop: u32) {
     let factory = enc.factory().map(|f| f.name().to_string()).unwrap_or_default();
     if factory.contains("nvh264enc") || factory.contains("nvd3d11h264enc") {
-        configure_nvenc(enc);
+        configure_nvenc(enc, bitrate_kbps, gop);
     } else if factory.contains("vaapi") || factory.contains("va") {
         if enc.find_property("rate-control").is_some() {
             enc.set_property_from_str("rate-control", "cbr");
         }
         if enc.find_property("bitrate").is_some() {
-            enc.set_property("bitrate", 20000u32);
+            enc.set_property("bitrate", bitrate_kbps);
         }
         if enc.find_property("keyframe-period").is_some() {
-            enc.set_property("keyframe-period", 120u32);
+            enc.set_property("keyframe-period", gop);
         }
         if enc.find_property("cabac").is_some() {
             enc.set_property("cabac", true);
         }
     } else if factory == "x264enc" {
-        enc.set_property("bitrate", 20000u32);
+        enc.set_property("bitrate", bitrate_kbps);
         enc.set_property_from_str("tune", "zerolatency");
         enc.set_property_from_str("speed-preset", "superfast");
-        enc.set_property("key-int-max", 120u32);
+        enc.set_property("key-int-max", gop);
         enc.set_property("bframes", 0u32);
     }
 }
@@ -745,6 +781,7 @@ fn build_mic_branch(
 fn link_video_chain(
     pipeline: &gst::Pipeline,
     _src_factory_name: &str,
+    _quality: StreamQuality,
     chain_start: &gst::Element,
     videoconvert: &gst::Element,
     videoscale: &gst::Element,
@@ -762,6 +799,7 @@ fn link_video_chain(
 fn link_video_chain(
     pipeline: &gst::Pipeline,
     src_factory_name: &str,
+    quality: StreamQuality,
     chain_start: &gst::Element,
     videoconvert: &gst::Element,
     videoscale: &gst::Element,
@@ -778,14 +816,7 @@ fn link_video_chain(
             .name("d3d11_capsfilter")
             .build()
             .map_err(|_| "Failed to create d3d11 capsfilter element".to_string())?;
-        let d3d11_caps = gst::Caps::builder("video/x-raw")
-            .features(["memory:D3D11Memory"])
-            .field("format", "NV12")
-            .field("width", 1920i32)
-            .field("height", 1080i32)
-            .field("framerate", gst::Fraction::new(60, 1))
-            .build();
-        d3d11_capsfilter.set_property("caps", &d3d11_caps);
+        d3d11_capsfilter.set_property("caps", &stream_caps(quality, true));
         pipeline.add_many(&[&d3d11convert, &d3d11_capsfilter])
             .map_err(|_| "Failed to add d3d11 zero-copy elements to pipeline".to_string())?;
         gst::Element::link_many(&[chain_start, &d3d11convert, &d3d11_capsfilter, videoenc, h264_capsfilter])
@@ -805,6 +836,22 @@ fn link_video_chain(
         gst::Element::link_many(&[chain_start, videoconvert, videoscale, capsfilter, videoenc, h264_capsfilter])
             .map_err(|e| format!("Failed to link video elements: {:?}", e))
     }
+}
+
+// Encoder input caps for a broadcast quality: NV12 at the preset's size and
+// rate. `d3d11` selects the zero-copy D3D11Memory variant.
+fn stream_caps(quality: StreamQuality, d3d11: bool) -> gst::Caps {
+    let mut caps = gst::Caps::builder("video/x-raw")
+        .field("format", "NV12")
+        .field("width", quality.width)
+        .field("height", quality.height)
+        .field("framerate", gst::Fraction::new(quality.fps, 1))
+        .build();
+    if d3d11 {
+        caps.get_mut().unwrap()
+            .set_features(0, Some(gst::CapsFeatures::new(["memory:D3D11Memory"])));
+    }
+    caps
 }
 
 // Caps probe callback
@@ -1286,6 +1333,7 @@ pub fn create_gstreamer_pipeline(
     mic_enabled: bool,
     mic_device_id: Option<String>,
     mic_initially_muted: bool,
+    quality: StreamQuality,
 ) -> Result<StreamStatus, String> {
     // Initialize GStreamer if not already initialized
     if let Err(e) = init() {
@@ -1408,17 +1456,11 @@ pub fn create_gstreamer_pipeline(
         .build()
         .map_err(|_| "Failed to create audio rtcp udpsrc element".to_string())?;
 
-    // 1080p60 NV12 — NVENC's native input format; skips an internal color
-    // conversion that I420 would force. d3d12/d3d11 capture sources emit at
-    // the native screen resolution; videoscale handles the rescale.
-    let caps = gst::Caps::builder("video/x-raw")
-        .field("format", "NV12")
-        .field("width", 1920i32)
-        .field("height", 1080i32)
-        .field("framerate", gst::Fraction::new(60, 1))
-        .build();
-
-    capsfilter.set_property("caps", &caps);
+    // NV12 at the quality preset — NVENC's native input format; skips an
+    // internal color conversion that I420 would force. d3d12/d3d11 capture
+    // sources emit at the native screen resolution; videoscale handles the
+    // rescale, and the capture source runs at the caps' frame rate.
+    capsfilter.set_property("caps", &stream_caps(quality, false));
 
     // High profile @ Level 4.2 — enough headroom for 1080p60. Must match
     // profile-level-id advertised by the frontend's rtpParameters.
@@ -1637,7 +1679,7 @@ pub fn create_gstreamer_pipeline(
     });
 
     configure_video_source(&src, window_handle, monitor_index);
-    configure_encoder(&videoenc);
+    configure_encoder(&videoenc, quality.bitrate_kbps, stream_gop(quality));
 
     rtph264pay.set_property("ssrc", VIDEO_SSRC);
     rtph264pay.set_property("pt", 100u32); // Must match payloadType declared by frontend
@@ -1757,7 +1799,7 @@ pub fn create_gstreamer_pipeline(
     tee.link(&queue_main)
         .map_err(|e| format!("Failed to link tee → queue_main: {:?}", e))?;
 
-    link_video_chain(&pipeline, &src_factory_name, &queue_main, &videoconvert, &videoscale, &capsfilter, &videoenc, &h264_capsfilter)?;
+    link_video_chain(&pipeline, &src_factory_name, quality, &queue_main, &videoconvert, &videoscale, &capsfilter, &videoenc, &h264_capsfilter)?;
 
     // h264_capsfilter → h264_tee → queue_rtp → rtph264pay
     gst::Element::link_many(&[&h264_capsfilter, &h264_tee])
@@ -2281,6 +2323,7 @@ pub fn start_streaming(
     mic_enabled: bool,
     mic_device_id: Option<String>,
     mic_initially_muted: bool,
+    quality: StreamQuality,
 ) -> Result<StreamStatus, String> {
     init()?;
 
@@ -2296,10 +2339,51 @@ pub fn start_streaming(
         &audio_host, audio_rtp_port, audio_rtcp_port,
         window_handle, process_pid, monitor_index,
         mic_enabled, mic_device_id, mic_initially_muted,
+        quality,
     )?;
 
     println!("[Audio] Stream status: {:?}", status);
+    println!("[GStreamer] Stream quality: {:?}", quality);
     Ok(status)
+}
+
+// Change the broadcast quality of the running pipeline in place (the weekly HD
+// grant ran out). Only the encoder settings and input caps change: the producer
+// and RTP session stay up, so viewers just see the picture change. The new caps
+// send a reconfigure upstream: the capture source renegotiates its frame rate,
+// d3d11convert/videoscale the size, and the encoder re-initialises with a new
+// SPS and IDR. Bitrate and GoP are applied first, so a failed caps change still
+// leaves the stream at the lower bitrate.
+pub fn set_stream_quality(quality: StreamQuality) -> Result<(), String> {
+    let pipeline = {
+        let state = STATE.lock().unwrap();
+        state.pipeline.as_ref()
+            .ok_or_else(|| "No active pipeline".to_string())?
+            .clone()
+    };
+
+    let enc = pipeline.by_name("videoenc")
+        .ok_or_else(|| "Video encoder not found in pipeline".to_string())?;
+    if enc.find_property("bitrate").is_some() {
+        enc.set_property("bitrate", quality.bitrate_kbps);
+    }
+    if enc.find_property("vbv-buffer-size").is_some() {
+        enc.set_property("vbv-buffer-size", vbv_kbits(quality.bitrate_kbps));
+    }
+    set_encoder_gop(&enc, stream_gop(quality));
+
+    let (capsfilter, d3d11) = match pipeline.by_name("d3d11_capsfilter") {
+        Some(f) => (f, true),
+        None => (
+            pipeline.by_name("capsfilter")
+                .ok_or_else(|| "Video capsfilter not found in pipeline".to_string())?,
+            false,
+        ),
+    };
+    capsfilter.set_property("caps", &stream_caps(quality, d3d11));
+
+    println!("[GStreamer] set_stream_quality({:?})", quality);
+    Ok(())
 }
 
 // Stop streaming function
@@ -2457,11 +2541,11 @@ pub fn start_recording(path: String, watermark_path: Option<std::path::PathBuf>)
 
     // Own encoder for the recording. nvd3d11h264enc is unusable here (its input
     // is system memory post-download), so use CUDA nvh264enc, falling back to
-    // software x264enc. configure_encoder() reuses the stream's bitrate/GOP.
+    // software x264enc, at the archive bitrate/GOP (not the broadcast quality).
     let enc = gst::ElementFactory::make("nvh264enc").name("rec_enc").build()
         .or_else(|_| gst::ElementFactory::make("x264enc").name("rec_enc").build())
         .map_err(|_| "No H.264 encoder for recording (tried nvh264enc, x264enc)".to_string())?;
-    configure_encoder(&enc);
+    configure_encoder(&enc, ARCHIVE_BITRATE_KBPS, ARCHIVE_GOP);
 
     let h264parse = make("h264parse", "rec_h264parse")?;
 
@@ -2762,7 +2846,7 @@ fn build_clip_video_branch(
     let enc = gst::ElementFactory::make("nvh264enc").build()
         .or_else(|_| gst::ElementFactory::make("x264enc").build())
         .map_err(|_| "No H.264 encoder for export (tried nvh264enc, x264enc)".to_string())?;
-    configure_encoder(&enc);
+    configure_encoder(&enc, ARCHIVE_BITRATE_KBPS, ARCHIVE_GOP);
     let h264parse = make("h264parse")?;
 
     let mut els: Vec<gst::Element> = vec![

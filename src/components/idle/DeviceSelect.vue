@@ -6,7 +6,13 @@ const props = defineProps<{
   value: string;
   options: string[];
   disabled?: boolean;
+  // Shown but not pickable (e.g. 1080p60 with no HD time left).
+  disabledOptions?: string[];
 }>();
+
+function isOptionDisabled(o: string) {
+  return !!props.disabledOptions?.includes(o);
+}
 
 const emit = defineEmits<{
   change: [value: string];
@@ -21,6 +27,7 @@ function toggle() {
 }
 
 function pick(o: string) {
+  if (isOptionDisabled(o)) return;
   emit('change', o);
   open.value = false;
 }
@@ -55,7 +62,8 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', onPointerDown)
         :key="o"
         type="button"
         class="option"
-        :class="{ selected: o === value }"
+        :class="{ selected: o === value, 'option-disabled': isOptionDisabled(o) }"
+        :disabled="isOptionDisabled(o)"
         @click="pick(o)"
       >
         <span class="radio" :class="{ on: o === value }">
@@ -123,7 +131,12 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', onPointerDown)
   gap: 6px;
   cursor: pointer;
 }
-.option:hover:not(.selected) { background: var(--surface-3); }
+.option:hover:not(.selected):not(.option-disabled) { background: var(--surface-3); }
+.option.option-disabled {
+  color: var(--text-mute);
+  cursor: default;
+  opacity: 0.6;
+}
 .option.selected {
   background: var(--accent-soft);
   color: var(--text);

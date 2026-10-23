@@ -7,6 +7,7 @@ import {
     ProduceRequestT,
     ProducerClosedRequestT,
 } from '../rpc/generated/mediasoup-signaling_generated';
+import { QUALITY_PRESETS, SD, encoderParams } from '../lib/streamQuality';
 
 // Must match rtph264pay properties in src-tauri/src/gstreamer.rs
 const VIDEO_PAYLOAD_TYPE = 100;
@@ -115,7 +116,9 @@ export function useMediaSoup() {
         rpc.registerHandler(Method.StreamEnded, () => serverEnded(gen, 'ended'));
     }
 
-    async function startSharing(windowHandle = null, processPid = null, micEnabled = false, micDeviceId = null, monitorIndex = null, access = 'public') {
+    // `quality` is a QUALITY_PRESETS entry (src/lib/streamQuality.ts), already
+    // cleared against the HD books by the caller.
+    async function startSharing(windowHandle = null, processPid = null, micEnabled = false, micDeviceId = null, monitorIndex = null, access = 'public', quality = QUALITY_PRESETS[SD]) {
         // A teardown during any await below cancels the start: nulls rpc, closes
         // the socket. Check after each one before going on.
         const gen = generation;
@@ -224,6 +227,7 @@ export function useMediaSoup() {
             micEnabled: !!micEnabled,
             micDeviceId: micEnabled ? (micDeviceId ?? null) : null,
             micInitiallyMuted: !micEnabled,
+            quality: encoderParams(quality),
         });
         pipelineStarting = starting;
         let status;

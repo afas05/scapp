@@ -24,6 +24,10 @@ import Connecting from './components/shared/Connecting.vue';
 import WindowPicker from './components/WindowPicker.vue';
 import SettingsModal from './components/shared/SettingsModal.vue';
 import { useSettingsStore } from './stores/settingsStore';
+import { useQualityStore } from './stores/qualityStore';
+import { useAutopostStore } from './stores/autopostStore';
+import { useHdGrant } from './composables/useHdGrant';
+import { QUALITY_PRESETS, COPY as QUALITY_COPY, PRICING_URL, type QualityId } from './lib/streamQuality';
 
 interface WindowInfo {
   id: number;
@@ -52,6 +56,19 @@ const router = useRouter();
 const userStore = useUserStore();
 const mediaSoup = useMediaSoup();
 const chat = useChat();
+const qualityStore = useQualityStore();
+const hdGrant = useHdGrant();
+const { liveQuality, hdEndsAt } = hdGrant;
+const autopostStore = useAutopostStore();
+// Shown on the home screen's plan summary; null = unknown or unlimited.
+const autopostLimit = computed(() => autopostStore.quota?.limit ?? null);
+
+// Re-read both sets of books (on mount and window focus), so an upgrade in the
+// browser takes effect without a restart.
+function refreshPlanLimits() {
+  qualityStore.fetchStatus();
+  autopostStore.fetchQuota();
+}
 
 type Phase = 'idle' | 'connecting' | 'live';
 const phase = ref<Phase>('idle');
@@ -212,6 +229,7 @@ mediaSoup.on('producerCreated', (id: string, session: string) => {
   streamStartedAt.value = Date.now();
   peakViewers.value = 0;
   safeInvoke('discord_set_streaming', { producerId: id });
+  hdGrant.onProducer(id);
   chat.open(id);
   growForChat();
 });
@@ -301,6 +319,10 @@ async function startStream() {
   noticeMessage.value = '';
   phase.value = 'connecting';
   try {
+    // Before capture starts: an HD grant starts counting the moment it is given.
+    const quality = await hdGrant.claimQuality(qualityStore.effectivePick);
+    const hdNotice = hdGrant.notice.value === 'hd_unavailable' ? QUALITY_COPY.noticeUnavailable : '';
+    noticeMessage.value = hdNotice;
     const config = await loadConfig();
     console.log('[MediaSoup] Connecting to SFU:', config.sfuWsUrl);
     await mediaSoup.init(userStore.sessionHash, config);
@@ -312,12 +334,13 @@ async function startStream() {
       micDevice.value || null,
       src.monitorIndex ?? null,
       visibility.value,
+      QUALITY_PRESETS[quality],
     );
     // The pipeline degrades instead of failing when an audio device won't
     // open; say so rather than letting the user find out from their viewers.
     if (status?.notice) {
       console.warn('[MediaSoup] Started with reduced audio:', status);
-      noticeMessage.value = status.notice;
+      noticeMessage.value = [hdNotice, status.notice].filter(Boolean).join(' ');
     }
     if (status?.mic === 'failed') micOn.value = false;
   } catch (err: any) {
@@ -367,6 +390,8 @@ async function stopStream() {
   } catch (err) {
     console.error('[MediaSoup] Error during teardown:', err);
   }
+  // Every end path (user Stop, server end, socket drop, failed start) lands here.
+  await hdGrant.release();
   finalizeSession();
   chat.close();
   restoreWindowSize();
@@ -374,6 +399,24 @@ async function stopStream() {
   producerId.value = '';
   userSession.value = '';
   safeInvoke('discord_clear');
+}
+
+// The weekly HD hour ran out mid-stream and the stream dropped to 720p30.
+watch(hdGrant.notice, (n) => {
+  if (n === 'hd_used_up') {
+    errorMessage.value = '';
+    noticeMessage.value = QUALITY_COPY.noticeUsedUp;
+  }
+});
+
+// Upgrades happen in the system browser; the Stripe webhook updates the tier and
+// the next window focus re-reads the books.
+function onUpgrade() {
+  open(PRICING_URL);
+}
+
+function onPickQuality(q: QualityId) {
+  qualityStore.pick(q);
 }
 
 function openStream() {
@@ -469,13 +512,39 @@ async function checkForUpdate() {
   }
 }
 
+let unlistenFocus: (() => void) | null = null;
+let unlistenClose: (() => void) | null = null;
+let unmounted = false;
+
+// Listener registration resolves later; one that lands after unmount is removed
+// straight away instead of outliving the view.
+function keepUnlisten(u: () => void, set: (u: () => void) => void) {
+  if (unmounted) u();
+  else set(u);
+}
+
 onMounted(() => {
   loadSources();
   loadMicDevices();
   getVersion().then(v => { appVersion.value = `v${v}`; }).catch(() => {});
+  refreshPlanLimits();
+  const win = getCurrentWindow();
+  // Re-read the books on focus, so an upgrade in the browser applies at once.
+  win.onFocusChanged(({ payload: focused }) => {
+    if (focused && phase.value === 'idle') refreshPlanLimits();
+  }).then(u => keepUnlisten(u, v => { unlistenFocus = v; })).catch(() => {});
+  // Quitting mid-HD-stream: close the books first (the window closes once the
+  // handler returns, as nothing prevents it).
+  win.onCloseRequested(async () => {
+    if (hdGrant.hasGrant()) await hdGrant.releaseWithTimeout(1000);
+  }).then(u => keepUnlisten(u, v => { unlistenClose = v; })).catch(() => {});
 });
 
 onBeforeUnmount(() => {
+  unmounted = true;
+  unlistenFocus?.();
+  unlistenClose?.();
+  hdGrant.release();
   stopPreviewTimer();
   chat.close();
   restoreWindowSize();
@@ -506,6 +575,16 @@ onBeforeUnmount(() => {
       :visibility="visibility"
       :last-session="lastSession"
       :update-status="updateStatus"
+      :quality="qualityStore.effectivePick"
+      :hd-available="qualityStore.hdAvailable"
+      :unlimited="qualityStore.unlimited"
+      :hd-left-minutes="qualityStore.hdLeftMinutes"
+      :resets-day="qualityStore.resetsDay"
+      :limited="qualityStore.limited"
+      :hd-limit-minutes="qualityStore.hdLimitMinutes"
+      :autopost-limit="autopostLimit"
+      @pick-quality="onPickQuality"
+      @upgrade="onUpgrade"
       @select="id => (selectedId = id)"
       @open-picker="showPicker = true"
       @toggle-mic="micOn = !micOn"
@@ -532,6 +611,10 @@ onBeforeUnmount(() => {
           :share-url="shareUrl"
           :preview-frame="previewFrame"
           :switching-id="switchingSourceId"
+          :quality="liveQuality"
+          :hd-ends-at="hdEndsAt"
+          :limited="qualityStore.limited"
+          @upgrade="onUpgrade"
           @select="onLiveSelectSource"
           @toggle-mic="onLiveToggleMic"
           @stop="stopStream"

@@ -24,6 +24,15 @@ export interface ProviderStatus {
     connect_url: string | null
 }
 
+// Daily posts per destination. All null on unlimited plans (limit === null);
+// that flag, not the tier id, decides whether a limit applies.
+export interface AutopostQuota {
+    limit: number | null
+    resets_at: string | null
+    renders: { used: number; remaining: number } | null
+    providers: Partial<Record<Service, { used: number; remaining: number }>> | null
+}
+
 export interface AutopostStatus {
     providers: Record<Service, ProviderStatus>
     settings: {
@@ -31,6 +40,7 @@ export interface AutopostStatus {
         default_privacy: Privacy
         watermark: unknown
     }
+    quota?: AutopostQuota
 }
 
 // Store for the clip-studio autopost feature: caches the server's default
@@ -44,6 +54,9 @@ export const useAutopostStore = defineStore('autopost', {
         lastPrivacy: 'private' as Privacy,
         lastServices: ['youtube'] as Service[],
         lastDescription: '',
+        // Daily autopost quota from GET /autopost/status, for the plan summary
+        // on the home screen. null until loaded.
+        quota: null as AutopostQuota | null,
         _hydrated: false,
     }),
     actions: {
@@ -81,6 +94,18 @@ export const useAutopostStore = defineStore('autopost', {
                 }
             } catch (err) {
                 console.warn('[autopostStore] fetchServerSettings failed:', err)
+            }
+        },
+        async fetchQuota() {
+            const token = useUserStore().sessionHash
+            if (!token) return
+            try {
+                const res = await useHttp('GET', 'autopost/status', undefined, token)
+                if (!res.ok) return
+                const data = await res.json()
+                this.quota = data?.quota ?? null
+            } catch (err) {
+                console.warn('[autopostStore] fetchQuota failed:', err)
             }
         },
         async persistLast(privacy: Privacy, services: Service[], description: string) {

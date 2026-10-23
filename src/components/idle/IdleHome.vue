@@ -9,6 +9,8 @@ import SetupRow from './SetupRow.vue';
 import SourceCard from './SourceCard.vue';
 import DeviceSelect from './DeviceSelect.vue';
 import { useMicLevel } from '../../composables/useMicLevel';
+import { HD, SD, COPY as QUALITY_COPY, PLAN_COPY, type QualityId } from '../../lib/streamQuality';
+import UpgradeButton from '../shared/UpgradeButton.vue';
 
 export interface IdleSource {
   id: number;
@@ -39,7 +41,26 @@ const props = withDefaults(defineProps<{
   visibility?: 'public' | 'private';
   lastSession?: { duration: string; peakViewers: number } | null;
   updateStatus?: string;
+  // Broadcast quality, from the server's HD books (qualityStore).
+  quality?: QualityId;
+  hdAvailable?: boolean;
+  unlimited?: boolean;
+  hdLeftMinutes?: number;
+  resetsDay?: string;
+  // Server confirmed a limited (Free) plan: show the plan chip, limits and Go Pro.
+  limited?: boolean;
+  hdLimitMinutes?: number;
+  // Autoposts per destination per day; null = unknown or unlimited.
+  autopostLimit?: number | null;
 }>(), {
+  limited: false,
+  hdLimitMinutes: 0,
+  autopostLimit: null,
+  quality: SD,
+  hdAvailable: false,
+  unlimited: false,
+  hdLeftMinutes: 0,
+  resetsDay: '',
   appVersion: '',
   sfuLatencyMs: 28,
   micDevice: '',
@@ -59,6 +80,8 @@ const emit = defineEmits<{
   pickMic: [device: string];
   pickCam: [device: string];
   pickVisibility: [value: 'public' | 'private'];
+  pickQuality: [value: QualityId];
+  upgrade: [];
   logout: [];
   checkUpdate: [];
   openSettings: [];
@@ -104,6 +127,19 @@ function onPickVisibility(label: string) {
   emit('pickVisibility', label === VISIBILITY_PRIVATE ? 'private' : 'public');
 }
 
+const QUALITY_OPTIONS: QualityId[] = [SD, HD];
+const qualityDisabled = computed(() => (props.hdAvailable ? [] : [HD]));
+function onPickQuality(value: string) {
+  if (value === SD || value === HD) emit('pickQuality', value);
+}
+
+// Share of the weekly HD hour still left, for the limits card meter.
+const hdLeftPct = computed(() =>
+  props.hdLimitMinutes > 0
+    ? Math.max(0, Math.min(100, (props.hdLeftMinutes / props.hdLimitMinutes) * 100))
+    : 0
+);
+
 // up to 4 cards, plus a "more" tile
 const quickSources = computed(() => props.sources.slice(0, 4));
 </script>
@@ -121,6 +157,10 @@ const quickSources = computed(() => props.sources.slice(0, 4));
           <span>Server ready</span>
           <span class="ws-mono ms">· {{ sfuLatencyMs }}ms</span>
         </div>
+        <template v-if="limited">
+          <span class="plan-chip">{{ PLAN_COPY.freePlan }}</span>
+          <UpgradeButton :label="PLAN_COPY.goPro" @click="emit('upgrade')" />
+        </template>
         <button type="button" class="ghost" @click="emit('logout')">
           <Icon name="logout" :size="11" />
           Logout
@@ -207,6 +247,28 @@ const quickSources = computed(() => props.sources.slice(0, 4));
               />
             </template>
           </SetupRow>
+
+          <SetupRow
+            icon="monitor"
+            :label="QUALITY_COPY.label"
+            :on="true"
+          >
+            <template #value>
+              <DeviceSelect
+                :value="quality"
+                :options="QUALITY_OPTIONS"
+                :disabled-options="qualityDisabled"
+                @change="onPickQuality"
+              />
+            </template>
+            <div v-if="limited" class="quality-hint">
+              <span v-if="hdAvailable">{{ QUALITY_COPY.hdLeft(hdLeftMinutes) }}</span>
+              <template v-else>
+                <span v-if="resetsDay">{{ QUALITY_COPY.hdUsedShort(resetsDay) }} · </span>
+                <a class="upgrade-link" @click.prevent="emit('upgrade')">{{ QUALITY_COPY.upgrade }}</a>
+              </template>
+            </div>
+          </SetupRow>
         </div>
 
         <div class="quick-strip">
@@ -228,6 +290,22 @@ const quickSources = computed(() => props.sources.slice(0, 4));
         </div>
 
         <div class="start-col">
+          <div v-if="limited" class="limits-card">
+            <div class="limits-head">
+              <span class="plan-chip">{{ PLAN_COPY.freePlan }}</span>
+              <span v-if="resetsDay" class="limits-reset">{{ PLAN_COPY.hdResets(resetsDay) }}</span>
+            </div>
+            <ul class="limits-list">
+              <li>{{ PLAN_COPY.sdAlways }}</li>
+              <li>
+                {{ PLAN_COPY.hdWeekly(hdLeftMinutes, hdLimitMinutes) }}
+                <div class="hd-meter"><span :style="{ width: hdLeftPct + '%' }" /></div>
+              </li>
+              <li v-if="autopostLimit !== null">{{ PLAN_COPY.autoposts(autopostLimit) }}</li>
+            </ul>
+            <div class="limits-pitch">{{ PLAN_COPY.proPitch }}</div>
+            <UpgradeButton block :label="QUALITY_COPY.upgrade" @click="emit('upgrade')" />
+          </div>
           <button type="button" class="primary" @click="emit('start')">
             <Icon name="play" :size="14" />
             Start streaming
@@ -417,6 +495,17 @@ const quickSources = computed(() => props.sources.slice(0, 4));
   color: var(--text-mute);
   letter-spacing: 0.4px;
 }
+.quality-hint {
+  margin-top: 6px;
+  font-size: 9px;
+  color: var(--text-mute);
+}
+.upgrade-link {
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: none;
+}
+.upgrade-link:hover { text-decoration: underline; }
 
 .quick-strip {
   grid-column: 1 / 2;
@@ -444,9 +533,61 @@ const quickSources = computed(() => props.sources.slice(0, 4));
   grid-column: 2 / 3;
   grid-row: 2 / 3;
   display: flex;
-  align-items: flex-end;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 8px;
   min-height: 0;
 }
+.plan-chip {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+}
+.limits-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-1);
+  border: 1px solid rgba(240, 180, 41, 0.35);
+}
+.limits-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.limits-reset { font-size: 9px; color: var(--text-mute); }
+.limits-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.hd-meter {
+  margin-top: 3px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.hd-meter span {
+  display: block;
+  height: 100%;
+  background: #f0b429;
+}
+.limits-pitch { font-size: 9px; color: var(--text-mute); }
 .start-col .primary {
   width: 100%;
   justify-content: center;

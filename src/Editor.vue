@@ -9,6 +9,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { LogicalSize } from '@tauri-apps/api/dpi';
 import Icon from './components/shared/Icon.vue';
+import UpgradeButton from './components/shared/UpgradeButton.vue';
 import { useSettingsStore } from './stores/settingsStore';
 import { useUserStore } from './stores/userStore';
 import {
@@ -18,6 +19,7 @@ import {
   type AutopostStatus,
 } from './stores/autopostStore';
 import { useHttp } from './composables/useHttp';
+import { PRICING_URL, COPY as QUALITY_COPY } from './lib/streamQuality';
 
 interface RecordingInfo {
   path: string;
@@ -247,9 +249,13 @@ const form = reactive({
 const posting = ref(false);
 const clipStates = reactive<Record<string, ClipState>>({});
 
+// Shown in the modal: a 403 daily_limit_reached message from the server.
+const postError = ref('');
+
 const selectedServices = computed(() => form.services);
 function toggleService(s: Service) {
   const i = form.services.indexOf(s);
+  if (i < 0 && usedUp(s)) return;
   if (i >= 0) form.services.splice(i, 1);
   else form.services.push(s);
 }
@@ -260,6 +266,30 @@ function connectUrl(s: Service): string | null {
   return status.value?.providers?.[s]?.connect_url ?? null;
 }
 
+// Daily autopost quota (Free: 1 per destination per day; limit null = unlimited).
+const quotaLimited = computed(() => status.value?.quota != null && status.value.quota.limit !== null);
+function remainingToday(s: Service): number | null {
+  if (!quotaLimited.value) return null;
+  return status.value?.quota?.providers?.[s]?.remaining ?? null;
+}
+function usedUp(s: Service): boolean {
+  return remainingToday(s) === 0;
+}
+const quotaResetsAt = computed(() => {
+  const at = status.value?.quota?.resets_at;
+  if (!at) return '';
+  const d = new Date(at);
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+});
+// A used-up destination can't be posted to: drop it, so a remembered
+// selection doesn't block the form.
+function dropUsedUp() {
+  form.services = form.services.filter(s => !usedUp(s));
+}
+function onUpgrade() {
+  openUrl(PRICING_URL);
+}
+
 async function openPostModal() {
   if (!clips.value.length) { error.value = 'Add at least one clip first.'; return; }
   await autopostStore.hydrate();
@@ -267,16 +297,22 @@ async function openPostModal() {
   form.services = [...(autopostStore.lastServices.length ? autopostStore.lastServices : autopostStore.defaultServices)];
   form.description = autopostStore.lastDescription;
   if (!form.title) form.title = currentName.value.replace(/\.[^.]+$/, '');
+  postError.value = '';
   showPost.value = true;
-  refreshStatus();
+  refreshStatus(true);
   autopostStore.fetchServerSettings();
 }
 
-async function refreshStatus() {
+// `dropUsed` only when the form opens: after that the user's selection is kept
+// as they left it (a 403 asks them to deselect, not us).
+async function refreshStatus(dropUsed = false) {
   statusLoading.value = true;
   try {
     const res = await useHttp('GET', 'autopost/status', undefined, userStore.sessionHash);
-    if (res.ok) status.value = await res.json();
+    if (res.ok) {
+      status.value = await res.json();
+      if (dropUsed && !posting.value) dropUsedUp();
+    }
   } catch (e: any) {
     console.warn('[Editor] status failed:', e);
   } finally {
@@ -293,8 +329,9 @@ const canSubmit = computed(() => {
   if (posting.value) return false;
   if (!form.title.trim() || form.title.length > 100) return false;
   if (!form.services.length) return false;
-  // Every chosen service must be connected.
-  return form.services.every(s => providerConnected(s));
+  // Every chosen service must be connected, and have a post left today: the
+  // server refuses the whole request if any is used up.
+  return form.services.every(s => providerConnected(s) && !usedUp(s));
 });
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
@@ -303,6 +340,7 @@ async function submitAll() {
   if (!canSubmit.value) return;
   posting.value = true;
   error.value = '';
+  postError.value = '';
   await autopostStore.persistLast(form.privacy, [...form.services], form.description);
 
   const tags = form.tags.split(',').map(t => t.trim()).filter(Boolean).slice(0, 30);
@@ -348,6 +386,19 @@ async function submitAll() {
         const missing = (resp.body?.missing ?? []).map((m: any) => m.provider).join(', ');
         st.phase = 'failed';
         st.message = `Not connected: ${missing || 'service'}`;
+      } else if (resp.status === 403 && resp.body?.code === 'daily_limit_reached') {
+        // Nothing was posted. Take the server's books, keep the form as it is
+        // so the user can deselect the used-up destinations and resubmit, and
+        // don't try the remaining clips: they'd hit the same limit.
+        const message = resp.body?.message || 'Daily post limit reached.';
+        if (status.value && resp.body?.quota) status.value.quota = resp.body.quota;
+        postError.value = message;
+        st.phase = 'failed';
+        st.message = message;
+        for (const rest of clips.value.slice(i + 1)) {
+          clipStates[rest.id] = reactive<ClipState>({ phase: 'failed', percent: 0, message: 'Not posted: daily limit reached' });
+        }
+        break;
       } else {
         st.phase = 'failed';
         st.message = resp.body?.message || `Upload rejected (${resp.status})`;
@@ -358,6 +409,9 @@ async function submitAll() {
     }
   }
   posting.value = false;
+  // Posts just made count against today's quota. After a 403 the books are
+  // already from its body; refetching would only race it.
+  if (!postError.value) refreshStatus();
 }
 
 async function pollPost(postId: number, st: ClipState) {
@@ -390,6 +444,8 @@ async function pollPost(postId: number, st: ClipState) {
 
 // --- export progress events --------------------------------------------------
 let unlisten: UnlistenFn | null = null;
+let unlistenFocus: UnlistenFn | null = null;
+let unmounted = false;
 
 // --- window sizing -----------------------------------------------------------
 async function back() {
@@ -408,11 +464,22 @@ onMounted(async () => {
     if (st && st.phase === 'exporting') st.percent = ev.payload.percent;
   });
 
+  // Re-read the quota on focus while the post form is open, so an upgrade in the
+  // browser (or a reset) applies without reopening it.
+  const u = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+    if (focused && showPost.value && !posting.value) refreshStatus();
+  }).catch(() => null);
+  // Unmounted while registering: don't leave the listener behind.
+  if (unmounted) u?.();
+  else unlistenFocus = u;
+
   loadRecordings();
 });
 
 onBeforeUnmount(async () => {
+  unmounted = true;
   if (unlisten) { unlisten(); unlisten = null; }
+  if (unlistenFocus) { unlistenFocus(); unlistenFocus = null; }
   try {
     const win = getCurrentWindow();
     await win.setSize(new LogicalSize(800, 600));
@@ -618,17 +685,25 @@ onBeforeUnmount(async () => {
                 <div
                   v-for="s in SERVICES" :key="s"
                   class="svc"
-                  :class="{ on: selectedServices.includes(s), off: !providerConnected(s) }"
+                  :class="{ on: selectedServices.includes(s), off: !providerConnected(s) || usedUp(s) }"
                 >
-                  <button type="button" class="svc-toggle" @click="toggleService(s)">
+                  <button
+                    type="button" class="svc-toggle"
+                    :disabled="usedUp(s) && !selectedServices.includes(s)"
+                    @click="toggleService(s)"
+                  >
                     <span class="chk" :class="{ on: selectedServices.includes(s) }">
                       <Icon v-if="selectedServices.includes(s)" name="check" :size="10" />
                     </span>
                     <span class="svc-name">{{ s }}</span>
                   </button>
-                  <span v-if="statusLoading" class="svc-status">…</span>
+                  <span v-if="statusLoading && !status" class="svc-status">…</span>
+                  <span v-else-if="usedUp(s)" class="svc-status">
+                    Used today{{ quotaResetsAt ? ` — resets ${quotaResetsAt}` : '' }} ·
+                    <a class="link" @click="onUpgrade">{{ QUALITY_COPY.upgrade }}</a>
+                  </span>
                   <span v-else-if="providerConnected(s)" class="svc-status ok">
-                    <Icon name="check" :size="10" /> connected
+                    <Icon name="check" :size="10" /> connected<template v-if="remainingToday(s) !== null"> · {{ remainingToday(s) }} left today</template>
                   </span>
                   <a v-else class="svc-status link" @click="connect(s)">
                     <Icon name="link" :size="10" /> connect on website ↗
@@ -636,9 +711,14 @@ onBeforeUnmount(async () => {
                 </div>
               </div>
             </div>
+            <div v-if="postError" class="post-error">{{ postError }}</div>
           </div>
 
           <div class="modal-footer">
+            <span v-if="quotaLimited" class="quota-note">
+              Free plan: {{ status?.quota?.limit }} post per destination per day
+            </span>
+            <UpgradeButton v-if="quotaLimited" :label="QUALITY_COPY.upgrade" @click="onUpgrade" />
             <button type="button" class="ghost" @click="showPost = false">Close</button>
             <button type="button" class="primary-sm" :disabled="!canSubmit" @click="submitAll">
               <Icon name="upload" :size="12" />
@@ -850,7 +930,7 @@ onBeforeUnmount(async () => {
 .modal-header h2 { font-size: 14px; font-weight: 600; }
 .modal-body { padding: 14px 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
 .modal-footer {
-  display: flex; justify-content: flex-end; gap: 8px;
+  display: flex; justify-content: flex-end; align-items: center; gap: 8px;
   padding: 12px 16px; border-top: 1px solid var(--border-soft);
 }
 .fld { display: flex; flex-direction: column; gap: 4px; }
@@ -885,4 +965,11 @@ onBeforeUnmount(async () => {
 .svc-status { font-size: 10px; color: var(--text-mute); display: inline-flex; align-items: center; gap: 3px; }
 .svc-status.ok { color: var(--live); }
 .svc-status.link { color: var(--accent); cursor: pointer; }
+.svc-status .link { color: var(--accent); cursor: pointer; }
+.svc.off .svc-toggle:disabled { cursor: default; opacity: 0.6; }
+.quota-note { margin-right: auto; font-size: 10px; color: var(--text-mute); }
+.post-error {
+  margin-top: 10px; padding: 8px 10px; border-radius: 6px; font-size: 11px;
+  color: #ff6b6b; background: rgba(255, 107, 107, 0.1); border: 1px solid #ff6b6b;
+}
 </style>

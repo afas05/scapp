@@ -24,6 +24,7 @@
     "process:allow-restart",
     "core:window:allow-set-size",
     "core:window:allow-center",
+    "core:window:allow-destroy",
     {
       "identifier": "http:default",
       "allow": [

@@ -11,6 +11,8 @@ import NetworkBars from './NetworkBars.vue';
 import MixerRow from './MixerRow.vue';
 import { useMicLevel, useSimulatedLevel, fmtDuration } from '../../composables/useMicLevel';
 import type { IdleSource, MicDevice } from '../idle/IdleHome.vue';
+import UpgradeButton from '../shared/UpgradeButton.vue';
+import { QUALITY_PRESETS, SD, PLAN_COPY, type QualityId } from '../../lib/streamQuality';
 
 const props = withDefaults(defineProps<{
   sources: IdleSource[];
@@ -23,7 +25,15 @@ const props = withDefaults(defineProps<{
   shareUrl?: string;
   previewFrame?: string;
   switchingId?: number | null;
+  // Quality going out now, and when the weekly HD grant ends (wall-clock ms;
+  // null = no countdown). `limited` = server-confirmed Free plan.
+  quality?: QualityId;
+  hdEndsAt?: number | null;
+  limited?: boolean;
 }>(), {
+  quality: SD,
+  hdEndsAt: null,
+  limited: false,
   micDevice: '',
   availableMics: () => [],
   viewerCount: 0,
@@ -40,6 +50,7 @@ const emit = defineEmits<{
   openSettings: [];
   startRecording: [];
   stopRecording: [];
+  upgrade: [];
 }>();
 
 const startedAt = ref(Date.now());
@@ -79,13 +90,27 @@ const trend = computed(() => {
   return h[h.length - 1] - (h[h.length - 8] ?? h[0]);
 });
 
+const preset = computed(() => QUALITY_PRESETS[props.quality]);
+
+// Simulated around the active preset's targets.
 const bitrate = computed(() => {
-  return (6.0 + Math.sin(tick.value * 0.3) * 0.4 + (Math.random() - 0.5) * 0.2).toFixed(1);
+  const base = (preset.value.maxBitrate / 1_000_000) * 0.75;
+  return (base + Math.sin(tick.value * 0.3) * 0.4 + (Math.random() - 0.5) * 0.2).toFixed(1);
 });
 
 const fps = computed(() =>
-  60 - Math.max(0, Math.round(Math.sin(tick.value * 0.2) * 0.5))
+  preset.value.fps - Math.max(0, Math.round(Math.sin(tick.value * 0.2) * 0.5))
 );
+
+const resolutionLabel = computed(() => `${preset.value.height}p`);
+
+// mm:ss of weekly HD left on this broadcast's grant.
+const hdLeftLabel = computed(() => {
+  if (props.hdEndsAt == null) return '';
+  void tick.value;
+  const secs = Math.max(0, Math.floor((props.hdEndsAt - Date.now()) / 1000));
+  return fmtDuration(secs);
+});
 
 const selectedMicName = computed(() =>
   props.availableMics.find(m => m.id === props.micDevice)?.name
@@ -157,8 +182,12 @@ const trendTone = computed<'up' | 'down'>(() => (trend.value >= 0 ? 'up' : 'down
         <span class="divider" />
         <Stat label="Bitrate" :value="bitrate" sub="Mbps" />
         <span class="divider" />
-        <Stat label="FPS" :value="fps" sub="1080p" />
+        <Stat label="FPS" :value="fps" :sub="resolutionLabel" />
         <span class="divider" />
+        <template v-if="hdLeftLabel">
+          <Stat :label="PLAN_COPY.hdLeftLive" :value="hdLeftLabel" sub="this week" />
+          <span class="divider" />
+        </template>
         <Stat label="Signal" value="" sub="Excellent" sub-tone="up">
           <template #value>
             <NetworkBars :strength="4" />
@@ -166,6 +195,7 @@ const trendTone = computed<'up' | 'down'>(() => (trend.value >= 0 ? 'up' : 'down
         </Stat>
       </div>
 
+      <UpgradeButton v-if="limited" class="go-pro" :label="PLAN_COPY.goPro" @click="emit('upgrade')" />
       <button type="button" class="ghost cog" @click="emit('openSettings')">
         <Icon name="cog" :size="11" />
       </button>
