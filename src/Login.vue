@@ -19,6 +19,8 @@ async function loginAction() {
       'login',
       { email: email.value, password: password.value }
   ).then(async (response) => {
+    // Version below the server minimum; useHttp has moved to /update-required.
+    if (response.status === 426) return;
     const data = await response.json();
 
     if (data.errors) {

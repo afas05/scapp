@@ -3,8 +3,7 @@ import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue';
 import { open } from '@tauri-apps/plugin-shell';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
-import { check } from '@tauri-apps/plugin-updater';
-import { relaunch } from '@tauri-apps/plugin-process';
+import { updateStatus, installUpdate, streaming as updaterStreaming } from './lib/updater';
 import { useRouter } from 'vue-router';
 import { useUserStore } from './stores/userStore';
 // @ts-ignore — JS composable, no .d.ts
@@ -95,8 +94,6 @@ const visibility = computed(() => settingsStore.visibility);
 const lastSession = ref<{ duration: string; peakViewers: number } | null>(null);
 const streamStartedAt = ref<number>(0);
 const peakViewers = ref<number>(0);
-const updateStatus = ref<string>('');
-const updateBusy = ref<boolean>(false);
 const appVersion = ref<string>('');
 
 const previewFrame = ref<string>('');
@@ -129,6 +126,7 @@ function stopPreviewTimer() {
 watch(phase, (p) => {
   if (p === 'live') startPreviewTimer();
   else stopPreviewTimer();
+  updaterStreaming.value = p !== 'idle';
 });
 
 const FALLBACK_SCREEN: IdleSource = {
@@ -491,25 +489,7 @@ async function onLogout() {
 }
 
 async function checkForUpdate() {
-  if (updateBusy.value) return;
-  updateBusy.value = true;
-  updateStatus.value = 'Checking for updates…';
-  try {
-    const update = await check();
-    if (!update) {
-      updateStatus.value = 'You are on the latest version.';
-      return;
-    }
-    updateStatus.value = `Downloading ${update.version}…`;
-    await update.downloadAndInstall();
-    updateStatus.value = 'Installed. Restarting…';
-    await relaunch();
-  } catch (err: any) {
-    console.error('[Updater] Failed:', err);
-    updateStatus.value = `Update failed: ${err?.message ?? err}`;
-  } finally {
-    updateBusy.value = false;
-  }
+  await installUpdate();
 }
 
 let unlistenFocus: (() => void) | null = null;
@@ -546,6 +526,7 @@ onBeforeUnmount(() => {
   unlistenClose?.();
   hdGrant.release();
   stopPreviewTimer();
+  updaterStreaming.value = false;
   chat.close();
   restoreWindowSize();
   if (phase.value === 'live' || phase.value === 'connecting') {

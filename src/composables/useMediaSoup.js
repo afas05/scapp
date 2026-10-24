@@ -8,6 +8,7 @@ import {
     ProducerClosedRequestT,
 } from '../rpc/generated/mediasoup-signaling_generated';
 import { QUALITY_PRESETS, SD, encoderParams } from '../lib/streamQuality';
+import { appVersion } from '../lib/updater';
 
 // Must match rtph264pay properties in src-tauri/src/gstreamer.rs
 const VIDEO_PAYLOAD_TYPE = 100;
@@ -76,8 +77,9 @@ export function useMediaSoup() {
     // sfuWsUrl  = 'wss://host:port'  (no trailing slash, no ?auth=)
     async function init(token, { sfuWsUrl }) {
         const gen = generation;
+        const version = await appVersion();
         const transport = await createWebSocketTransport(
-            sfuWsUrl + '?auth=',
+            sfuWsUrl + '?v=' + encodeURIComponent(version) + '&auth=',
             token,
             () => serverEnded(gen, 'disconnected'),
         );
