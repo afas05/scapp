@@ -22,6 +22,8 @@ import {
     CreateProducerPlainTransportResponse,
     ChatMessageRequest,
     ChatDeletedRequest,
+    StartStreamRequest,
+    StopStreamRequest,
 } from './generated/mediasoup-signaling_generated';
 
 export { Method };
@@ -40,4 +42,7 @@ export const schema = defineSchema({
     [Method.CreateProducerPlainTransport]: { Req: CreateProducerPlainTransportRequest, Res: CreateProducerPlainTransportResponse },
     [Method.ChatMessage]: { Req: ChatMessageRequest },
     [Method.ChatDeleted]: { Req: ChatDeletedRequest },
+    // Remote control by an AI assistant; sent only on the desktop /events socket.
+    [Method.StartStream]: { Req: StartStreamRequest },
+    [Method.StopStream]: { Req: StopStreamRequest },
 });

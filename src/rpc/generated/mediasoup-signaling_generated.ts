@@ -22,6 +22,10 @@ export { ProduceResponse, ProduceResponseT } from './mediasoup-signaling/produce
 export { ProducerClosedRequest, ProducerClosedRequestT } from './mediasoup-signaling/producer-closed-request';
 export { ResumeRequest, ResumeRequestT } from './mediasoup-signaling/resume-request';
 export { ResumeResponse, ResumeResponseT } from './mediasoup-signaling/resume-response';
+export { ResumeSessionRequest, ResumeSessionRequestT } from './mediasoup-signaling/resume-session-request';
+export { ResumeSessionResponse, ResumeSessionResponseT } from './mediasoup-signaling/resume-session-response';
+export { StartStreamRequest, StartStreamRequestT } from './mediasoup-signaling/start-stream-request';
+export { StopStreamRequest, StopStreamRequestT } from './mediasoup-signaling/stop-stream-request';
 export { StreamEndedRequest, StreamEndedRequestT } from './mediasoup-signaling/stream-ended-request';
 export { ViewerCountRequest, ViewerCountRequestT } from './mediasoup-signaling/viewer-count-request';
 export { ViewerJoinedRequest, ViewerJoinedRequestT } from './mediasoup-signaling/viewer-joined-request';

@@ -17,5 +17,8 @@ export enum Method {
   ViewerJoined = 13,
   ViewerLeft = 14,
   ChatMessage = 15,
-  ChatDeleted = 16
+  ChatDeleted = 16,
+  ResumeSession = 17,
+  StartStream = 18,
+  StopStream = 19
 }

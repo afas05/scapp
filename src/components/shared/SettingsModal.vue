@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { open as openUrl } from '@tauri-apps/plugin-shell';
 import Icon from './Icon.vue';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useUserStore } from '../../stores/userStore';
@@ -12,6 +13,10 @@ const settingsStore = useSettingsStore();
 const userStore = useUserStore();
 const editPath = ref('');
 const editHideWatermark = ref(false);
+const editAllowAssistant = ref(true);
+
+// Where connected AI assistants are listed and can be disconnected.
+const ASSISTANTS_URL = 'https://streamsnipe.live/profile#ai-assistants';
 
 // Free tier (plan 1) can't remove the watermark, so the control is hidden.
 const isPaid = computed(() => userStore.subscription_tier_id !== 1);
@@ -20,6 +25,7 @@ watch(() => props.modelValue, (open) => {
   if (open) {
     editPath.value = settingsStore.recordingPath;
     editHideWatermark.value = settingsStore.hideWatermark;
+    editAllowAssistant.value = settingsStore.allowAssistantControl;
   }
 });
 
@@ -29,6 +35,7 @@ function close() {
 
 async function save() {
   await settingsStore.setRecordingPath(editPath.value);
+  await settingsStore.setAllowAssistantControl(editAllowAssistant.value);
   if (isPaid.value) {
     await settingsStore.setHideWatermark(editHideWatermark.value);
   }
@@ -84,6 +91,17 @@ async function browseFolder() {
               <span class="setting-label">Hide watermark on recordings</span>
             </label>
             <p class="setting-hint">Remove the streamsnipe.live watermark from saved recordings</p>
+          </div>
+
+          <div class="setting-group">
+            <label class="toggle-row">
+              <input type="checkbox" v-model="editAllowAssistant" />
+              <span class="setting-label">Allow AI assistants to control streaming</span>
+            </label>
+            <p class="setting-hint">
+              Connected assistants can start and stop your stream.
+              <a class="hint-link" href="#" @click.prevent="openUrl(ASSISTANTS_URL)">Manage connected assistants</a>
+            </p>
           </div>
         </div>
 
@@ -207,6 +225,12 @@ async function browseFolder() {
   color: var(--text-mute);
 }
 
+.hint-link {
+  color: var(--accent);
+  text-decoration: none;
+  cursor: pointer;
+}
+.hint-link:hover { text-decoration: underline; }
 .toggle-row {
   display: flex;
   align-items: center;

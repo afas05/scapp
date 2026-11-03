@@ -13,6 +13,7 @@
       "allow": [{ "path": "**" }]
     },
     "dialog:default",
+    "notification:default",
     "websocket:default",
     "shell:default",
     "store:allow-load",

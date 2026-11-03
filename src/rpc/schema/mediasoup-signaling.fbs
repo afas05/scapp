@@ -18,6 +18,9 @@ enum Method: uint16 {
     ViewerLeft = 14,
     ChatMessage = 15,
     ChatDeleted = 16,
+    ResumeSession = 17,
+    StartStream = 18,
+    StopStream = 19,
 }
 
 // --- CreateProducerTransport ---
@@ -88,6 +91,17 @@ table ConsumeResponse {
 table ResumeRequest {}
 
 table ResumeResponse {}
+
+// --- ResumeSession ---
+// Sent first on a socket opened with `&resume=<session hash>`, after the previous
+// socket of a live broadcast dropped. `resumed` is true only when that broadcast
+// was still alive (inside the signalling server's grace period) and this socket
+// now owns it; false means it is gone and the client must end it locally.
+table ResumeSessionRequest {}
+
+table ResumeSessionResponse {
+    resumed: bool;
+}
 
 // --- ProducerClosed (notification, no response) ---
 table ProducerClosedRequest {}
@@ -182,4 +196,21 @@ table PostUpdatedRequest {
     post_id: string;
     state: string;          // processing | done | failed (derived from the targets)
     targets: [PostTargetState];
+}
+
+// --- StartStream / StopStream (server → desktop app notifications) ---
+// Remote control of the desktop app by an AI assistant (Laravel's MCP server).
+// Sent only to the user's desktop app, over its notify-only /events socket.
+// The app answers by acting, not by replying: Laravel confirms a start by
+// waiting for the broadcast's `streams` row. See
+// ssapp/desktop-mcp-remote-control-spec.md.
+table StartStreamRequest {
+    request_id: string;
+    access: string;         // 'public' | 'private'
+    requested_by: string;   // assistant's display name, e.g. "Claude"
+}
+
+table StopStreamRequest {
+    request_id: string;
+    requested_by: string;
 }

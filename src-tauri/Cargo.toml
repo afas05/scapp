@@ -23,12 +23,17 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-websocket = "2"
-tauri-plugin-http = "2"
+# Default features minus `cookies`: auth is the Bearer token only, and the
+# plugin's cookie jar replayed Laravel session cookies from a failed login,
+# which made every later login fail until restart. `credentials: 'omit'` is
+# ignored by the plugin, so the jar has to be compiled out.
+tauri-plugin-http = { version = "2", default-features = false, features = ["rustls-tls", "http2", "charset", "macos-system-configuration"] }
 tauri-plugin-shell = "2"
 tauri-plugin-store = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
 gstreamer = "0.21.1"
 gstreamer-rtp = "0.21.1"
 gstreamer-pbutils = "0.21.0"

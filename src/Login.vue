@@ -13,6 +13,7 @@ async function loginAction() {
   if (!email.value || !password.value) {
     return;
   }
+  errorMessage.value = '';
 
   await useHttp(
       'POST',
@@ -21,13 +22,22 @@ async function loginAction() {
   ).then(async (response) => {
     // Version below the server minimum; useHttp has moved to /update-required.
     if (response.status === 426) return;
-    const data = await response.json();
+    let data: any = null;
+    try {
+      data = await response.json();
+    } catch { /* non-JSON body */ }
 
-    if (data.errors) {
-      for (const error in data.errors) {
-        errorMessage.value += data.errors[error][0] + '\n'
-      }
+    if (data?.errors) {
+      errorMessage.value = Object.values(data.errors)
+          .map((messages: any) => messages[0])
+          .join('\n');
+      return;
+    }
 
+    // Any other failure (419, 429, 500, ...) has no `errors`; don't treat it as a login.
+    if (!response.ok || !data?.user || !data?.access_token) {
+      console.warn('[login] unexpected response', response.status, data);
+      errorMessage.value = data?.message || `Login failed (${response.status})`;
       return;
     }
 

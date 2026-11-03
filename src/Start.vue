@@ -22,7 +22,8 @@ import { useChat, type ChatMessage } from './composables/useChat';
 import Connecting from './components/shared/Connecting.vue';
 import WindowPicker from './components/WindowPicker.vue';
 import SettingsModal from './components/shared/SettingsModal.vue';
-import { useSettingsStore } from './stores/settingsStore';
+import { useSettingsStore, type SavedSource } from './stores/settingsStore';
+import { setRemoteHandlers, logRemote, notify, type RemoteStart, type RemoteStop } from './lib/desktopEvents';
 import { useQualityStore } from './stores/qualityStore';
 import { useAutopostStore } from './stores/autopostStore';
 import { useHdGrant } from './composables/useHdGrant';
@@ -87,6 +88,8 @@ const viewerCount = ref<number>(0);
 const errorMessage = ref<string>('');
 // Non-fatal: the stream is live, but with less audio than was asked for.
 const noticeMessage = ref<string>('');
+// Set when an AI assistant started this broadcast; shown with a Stop button.
+const remoteBanner = ref<string>('');
 const showPicker = ref<boolean>(false);
 const showSettings = ref<boolean>(false);
 const settingsStore = useSettingsStore();
@@ -201,6 +204,50 @@ async function loadSources() {
   }
 }
 
+// What gets saved for a remote start to reuse. Only called for a choice the user
+// made (pick, Go Live), never for the auto-selected first monitor.
+function toSaved(src: IdleSource): SavedSource {
+  return src.monitorIndex !== undefined
+    ? { kind: 'monitor', index: src.monitorIndex, name: src.title }
+    : { kind: 'window', processName: src.processName, title: src.title };
+}
+
+function rememberSource(id: number) {
+  const src = sources.value.find(s => s.id === id);
+  if (src) settingsStore.setLastSource(toSaved(src));
+}
+
+// The saved source in the current list, or undefined if it is gone (window
+// closed, monitor unplugged). Windows get new handles on every launch, so they
+// match on process, preferring the same title.
+function findSaved(saved: SavedSource | null): IdleSource | undefined {
+  if (!saved) return undefined;
+  if (saved.kind === 'monitor') {
+    return sources.value.find(s => s.monitorIndex === saved.index);
+  }
+  const sameProcess = sources.value.filter(s => s.monitorIndex === undefined && s.processName === saved.processName);
+  return sameProcess.find(s => s.title === saved.title) ?? sameProcess[0];
+}
+
+function restoreSavedSource() {
+  const src = findSaved(settingsStore.lastSource);
+  if (src) selectedId.value = src.id;
+}
+
+function restoreSavedMic() {
+  const saved = settingsStore.lastMic;
+  if (!saved) return;
+  micOn.value = saved.on;
+  if (saved.deviceId && availableMics.value.some(m => m.id === saved.deviceId)) {
+    micDevice.value = saved.deviceId;
+  }
+}
+
+function onSelectSource(id: number) {
+  selectedId.value = id;
+  rememberSource(id);
+}
+
 const selectedSource = computed(() =>
   sources.value.find(s => s.id === selectedId.value) || sources.value[0]
 );
@@ -311,8 +358,17 @@ function finalizeSession() {
   streamStartedAt.value = 0;
 }
 
-async function startStream() {
+// Go Live pressed: this source and mic are now the ones a remote start reuses.
+function onGoLive() {
+  if (selectedSource.value) settingsStore.setLastSource(toSaved(selectedSource.value));
+  settingsStore.setLastMic({ on: micOn.value, deviceId: micDevice.value });
+  startStream();
+}
+
+// `access` overrides the saved visibility for this broadcast only (remote start).
+async function startStream(opts: { access?: 'public' | 'private' } = {}) {
   if (!selectedSource.value) return;
+  remoteBanner.value = '';
   errorMessage.value = '';
   noticeMessage.value = '';
   phase.value = 'connecting';
@@ -331,7 +387,7 @@ async function startStream() {
       micOn.value,
       micDevice.value || null,
       src.monitorIndex ?? null,
-      visibility.value,
+      opts.access ?? visibility.value,
       QUALITY_PRESETS[quality],
     );
     // The pipeline degrades instead of failing when an audio device won't
@@ -348,6 +404,55 @@ async function startStream() {
     errorMessage.value = `Failed to start stream: ${err?.message ?? err}`;
     await stopStream();
   }
+}
+
+// An AI assistant asked to go live (StartStream over the /events socket). Same
+// path as Go Live, with the source and mic the user last chose. No window
+// raising: there is no tray, and capture works while the window is minimised.
+async function remoteStart({ requestId, access, requestedBy }: RemoteStart) {
+  if (phase.value !== 'idle') {
+    logRemote('StartStream', requestId, 'already_live');
+    return;
+  }
+  await Promise.all([loadSources(), loadMicDevices()]);
+  if (phase.value !== 'idle') {
+    logRemote('StartStream', requestId, 'already_live');
+    return;
+  }
+  const src = findSaved(settingsStore.lastSource);
+  if (!src) {
+    logRemote('StartStream', requestId, 'no_source');
+    const text = `${requestedBy} tried to start your stream, but no capture source is selected. Open StreamSnipe to pick one.`;
+    errorMessage.value = '';
+    noticeMessage.value = text;
+    notify(text);
+    return;
+  }
+  selectedId.value = src.id;
+  restoreSavedMic();
+
+  await startStream({ access });
+  // The await changed it; TS still narrows phase to 'idle' here.
+  if ((phase.value as Phase) !== 'live') {
+    logRemote('StartStream', requestId, `failed: ${errorMessage.value || 'did not go live'}`);
+    return;
+  }
+  logRemote('StartStream', requestId, 'started');
+  const text = `${requestedBy} started your stream (${access}).`;
+  remoteBanner.value = text;
+  notify(text);
+}
+
+// An AI assistant asked to stop. The server only sends this for the app's own
+// broadcasts (or when it can't tell), so not being live means nothing to do.
+async function remoteStop({ requestId, requestedBy }: RemoteStop) {
+  if (phase.value === 'idle') {
+    logRemote('StopStream', requestId, 'ignored_not_live');
+    return;
+  }
+  await stopStream();
+  logRemote('StopStream', requestId, 'stopped');
+  notify(`${requestedBy} ended your stream.`);
 }
 
 async function onLiveToggleMic() {
@@ -373,6 +478,7 @@ async function onLiveSelectSource(id: number) {
       src.monitorIndex ?? null,
     );
     selectedId.value = id;
+    rememberSource(id);
   } catch (err: any) {
     console.error('[Source] switch failed:', err);
     errorMessage.value = `Failed to switch source: ${err?.message ?? err}`;
@@ -393,6 +499,7 @@ async function stopStream() {
   finalizeSession();
   chat.close();
   restoreWindowSize();
+  remoteBanner.value = '';
   phase.value = 'idle';
   producerId.value = '';
   userSession.value = '';
@@ -470,13 +577,13 @@ async function onPickerSelected(payload: { windowHandle: number; processPid: num
     if (!sources.value.some(s => s.id === monitorId)) {
       await loadSources();
     }
-    selectedId.value = monitorId;
+    onSelectSource(monitorId);
     return;
   }
   if (!sources.value.some(s => s.id === payload.windowHandle)) {
     await loadSources();
   }
-  selectedId.value = payload.windowHandle;
+  onSelectSource(payload.windowHandle);
 }
 
 async function onLogout() {
@@ -504,8 +611,9 @@ function keepUnlisten(u: () => void, set: (u: () => void) => void) {
 }
 
 onMounted(() => {
-  loadSources();
-  loadMicDevices();
+  loadSources().then(restoreSavedSource);
+  loadMicDevices().then(restoreSavedMic);
+  setRemoteHandlers({ start: remoteStart, stop: remoteStop });
   getVersion().then(v => { appVersion.value = `v${v}`; }).catch(() => {});
   refreshPlanLimits();
   const win = getCurrentWindow();
@@ -522,6 +630,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   unmounted = true;
+  setRemoteHandlers(null);
   unlistenFocus?.();
   unlistenClose?.();
   hdGrant.release();
@@ -566,12 +675,12 @@ onBeforeUnmount(() => {
       :autopost-limit="autopostLimit"
       @pick-quality="onPickQuality"
       @upgrade="onUpgrade"
-      @select="id => (selectedId = id)"
+      @select="onSelectSource"
       @open-picker="showPicker = true"
       @toggle-mic="micOn = !micOn"
       @pick-mic="v => (micDevice = v)"
       @pick-visibility="v => settingsStore.setVisibility(v)"
-      @start="startStream"
+      @start="onGoLive"
       @logout="onLogout"
       @check-update="checkForUpdate"
       @open-settings="showSettings = true"
@@ -581,6 +690,11 @@ onBeforeUnmount(() => {
 
     <div v-else-if="phase === 'live'" class="live-row">
       <div class="live-main">
+        <div v-if="remoteBanner" class="remote-banner">
+          <span>{{ remoteBanner }}</span>
+          <button class="remote-stop" @click="stopStream">Stop</button>
+          <button class="notice-dismiss" @click="remoteBanner = ''" aria-label="Dismiss">×</button>
+        </div>
         <LiveDashboard
           :sources="sources"
           :selected-id="selectedId"
@@ -673,6 +787,34 @@ onBeforeUnmount(() => {
   line-height: 1;
   padding: 0;
 }
+.remote-banner {
+  position: absolute;
+  bottom: 76px;
+  left: 14px;
+  right: 14px;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--accent-soft);
+  border-radius: 8px;
+  padding: 0.5rem 0.8rem;
+  font-size: 11px;
+}
+.remote-stop {
+  margin-left: auto;
+  padding: 3px 10px;
+  border-radius: 5px;
+  border: none;
+  background: #ff6b6b;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.remote-banner .notice-dismiss { margin-left: 0; }
 .live-row {
   flex: 1;
   display: flex;

@@ -20,6 +20,24 @@ async function defaultRecordingPath(): Promise<string> {
     }
 }
 
+// The capture source the user last chose themselves, so a remote start (AI
+// assistant) uses it after a restart. Window handles don't survive a restart, so
+// windows are matched by process name and title. The auto-selected primary
+// monitor is never saved: an assistant must not stream a desktop nobody chose.
+export type SavedSource =
+    | { kind: 'monitor'; index: number; name: string }
+    | { kind: 'window'; processName: string; title: string }
+
+export interface SavedMic {
+    on: boolean
+    deviceId: string
+}
+
+function isSavedSource(v: any): v is SavedSource {
+    return (v?.kind === 'monitor' && typeof v.index === 'number' && typeof v.name === 'string')
+        || (v?.kind === 'window' && typeof v.processName === 'string' && typeof v.title === 'string')
+}
+
 export const useSettingsStore = defineStore('settings', {
     state: () => ({
         recordingPath: '',
@@ -27,6 +45,11 @@ export const useSettingsStore = defineStore('settings', {
         // Paid-tier opt-out for the recording watermark. Default false = shown.
         // Ignored for free-tier users (their watermark is always applied).
         hideWatermark: false,
+        // "Allow AI assistants to control streaming". Default on: the user
+        // already approved it on the OAuth consent screen.
+        allowAssistantControl: true,
+        lastSource: null as SavedSource | null,
+        lastMic: null as SavedMic | null,
         _hydrated: false,
     }),
     actions: {
@@ -48,6 +71,18 @@ export const useSettingsStore = defineStore('settings', {
                 const savedHideWatermark = await store.get<boolean>('hideWatermark')
                 if (typeof savedHideWatermark === 'boolean') {
                     this.hideWatermark = savedHideWatermark
+                }
+                const savedAllow = await store.get<boolean>('allowAssistantControl')
+                if (typeof savedAllow === 'boolean') {
+                    this.allowAssistantControl = savedAllow
+                }
+                const savedSource = await store.get('lastSource')
+                if (isSavedSource(savedSource)) {
+                    this.lastSource = savedSource
+                }
+                const savedMic = await store.get<SavedMic>('lastMic')
+                if (typeof savedMic?.on === 'boolean' && typeof savedMic?.deviceId === 'string') {
+                    this.lastMic = savedMic
                 }
             } catch (err) {
                 console.error('[settingsStore] hydrate failed:', err)
@@ -74,6 +109,27 @@ export const useSettingsStore = defineStore('settings', {
                 await store.save()
             } catch (err) {
                 console.error('[settingsStore] Failed to persist hideWatermark:', err)
+            }
+        },
+        async setAllowAssistantControl(allow: boolean) {
+            this.allowAssistantControl = allow
+            await this.persist('allowAssistantControl', allow)
+        },
+        async setLastSource(source: SavedSource) {
+            this.lastSource = source
+            await this.persist('lastSource', source)
+        },
+        async setLastMic(mic: SavedMic) {
+            this.lastMic = mic
+            await this.persist('lastMic', mic)
+        },
+        async persist(key: string, value: unknown) {
+            try {
+                const store = await getStore()
+                await store.set(key, value)
+                await store.save()
+            } catch (err) {
+                console.error(`[settingsStore] Failed to persist ${key}:`, err)
             }
         },
         async setRecordingPath(path: string) {

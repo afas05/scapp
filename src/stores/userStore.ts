@@ -120,6 +120,10 @@ export const useUserStore = defineStore('user', {
                             this.subscription_tier_id = extractPlan(data) ?? this.subscription_tier_id
                             this.userId = extractUserId(data) ?? this.userId
                         } catch { /* keep default plan */ }
+                    } else if (response.status === 426) {
+                        // Below the server minimum; useHttp has moved to /update-required.
+                        // Keep the stored session for after the update.
+                        return
                     } else if (response.status === 401 || response.status === 403) {
                         console.warn('[userStore] Token rejected by server (', response.status, '), clearing credentials')
                         await this.logout()

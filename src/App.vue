@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, computed } from 'vue';
+import { onMounted, onBeforeUnmount, computed, watch } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { useUserStore } from './stores/userStore';
 import { useSettingsStore } from './stores/settingsStore';
@@ -12,6 +12,7 @@ import {
   startUpdateChecks,
   installUpdate,
 } from './lib/updater';
+import { startDesktopEvents, stopDesktopEvents } from './lib/desktopEvents';
 
 const userStore = useUserStore();
 const settingsStore = useSettingsStore();
@@ -30,7 +31,28 @@ function dismissUpdate() {
 }
 
 let stopUpdateChecks: (() => void) | null = null;
-onBeforeUnmount(() => stopUpdateChecks?.());
+onBeforeUnmount(() => {
+  stopUpdateChecks?.();
+  stopDesktopEvents();
+});
+
+// The /events socket is open exactly while someone is signed in: it is how the
+// server knows the app is running, and how AI assistants reach it (lib/desktopEvents.ts).
+watch(() => userStore.isLoggedIn, (loggedIn) => {
+  if (!loggedIn) {
+    stopDesktopEvents();
+    return;
+  }
+  startDesktopEvents({
+    async onUnauthorized() {
+      await userStore.logout();
+      await router.replace('/login');
+    },
+    async openStartView() {
+      if (route.path !== '/start') await router.push('/start');
+    },
+  });
+}, { immediate: true });
 
 onMounted(async () => {
   stopUpdateChecks = startUpdateChecks();
