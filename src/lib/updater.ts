@@ -1,4 +1,4 @@
-import { ref } from 'vue';
+import { ref, shallowRef } from 'vue';
 import { getVersion } from '@tauri-apps/api/app';
 import { check, type Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
@@ -11,7 +11,9 @@ export const DOWNLOAD_URL = 'https://streamsnipe.live/download';
 export const updateRequired = ref<string | null>(null);
 
 // Found by the quiet background check; drives the optional "update available" banner.
-export const availableUpdate = ref<Update | null>(null);
+// shallowRef, not ref: a deep ref wraps the Update in a reactive Proxy, and its
+// methods then fail on the class's #private fields ("Cannot read private member").
+export const availableUpdate = shallowRef<Update | null>(null);
 // The version whose banner the user closed. A newer release shows it again.
 export const dismissedVersion = ref<string | null>(null);
 // True while connecting or live (set by Start.vue). Installing restarts the app,
